@@ -43,7 +43,7 @@ UA = (
 )
 
 st.set_page_config(
-    page_title="Tự học tiếng Anh từ Shorts",
+    page_title="Learn English from Shorts with SI",
     page_icon="🎧",
     layout="centered",
     initial_sidebar_state="expanded",
@@ -82,7 +82,7 @@ init_state()
 def check_password() -> bool:
     if st.session_state.auth:
         return True
-    st.title("🎧 Tự học tiếng Anh từ Shorts")
+    st.title("🎧 Học tiếng Anh từ video với AI")
     expected = st.secrets.get("APP_PASSWORD", "")
     if not expected:
         st.error("Chưa đặt APP_PASSWORD trong Secrets của Streamlit.")
@@ -489,9 +489,25 @@ def sidebar():
     st.sidebar.header("📺 Kênh học tiếng Anh")
     channels = load_channels()
 
+    if "lcsA" not in st.session_state:
+        st.session_state.lcsA = [i for i in range(len(channels))]
+        random.shuffle(st.session_state.lcsA)
+
+    if "count" not in st.session_state:
+        st.session_state.count = -1
+
+
     # --- Lấy ngẫu nhiên 1 bài từ một kênh bất kỳ trong cac_kenh.json ---
-    if st.sidebar.button("🎲 Lấy ngẫu nhiên 1 bài", disabled=not channels):
-        pick = random.choice(channels)
+    if st.sidebar.button("🎲 Lấy ngẫu nhiên bài", disabled=not channels):
+        st.session_state.count += 1
+        pick = channels[st.session_state.lcsA[st.session_state.count]]
+        st.write(st.session_state.count, pick)
+        head = f"Kênh: {pick['name']} ({pick['id']})"
+        if st.session_state.count == len(channels)-1:
+            st.session_state.count = -1
+            random.shuffle(st.session_state.lcsA)
+
+        #pick = random.choice(channels)
         head = f"Kênh: {pick['name']} ({pick['id']})"
         try:
             with st.spinner(f"Đang tìm bài mới nhất của {pick['name']}..."):
@@ -542,11 +558,12 @@ def sidebar():
         [
             {
                 "Chọn": c["id"] == sel_id,
-                "Tên kênh": c["name"],
+                "Tên kênh": str(i+1) + '. ' + c["name"],
                 "Id của kênh": c["id"],
                 "Xóa": c["id"] in del_ids,
+                "Url": "https://www.youtube.com/channel/UCFfinPB9xvedvsi-PlMYeyA"
             }
-            for c in channels
+            for i, c in enumerate(channels)
         ]
     )
     edited = st.sidebar.data_editor(
@@ -895,7 +912,7 @@ def main_screen():
     if not vid:
         st.title("🎧 Tự học tiếng Anh từ Shorts")
         st.info(
-            "👈 Mở thanh bên: chọn kênh → bấm **Tìm video** → chọn một bài. "
+            "👈 Mở thanh bên: bấm **Lấy ngẫu nhiên bài**, hoặc Chọn kênh → bấm **Tìm video** → chọn một bài. "
             "(Trên iPhone, bấm mũi tên ở góc trên bên trái để mở thanh bên.)"
         )
         return
