@@ -11,6 +11,7 @@ Secrets cần có (Streamlit Cloud -> App settings -> Secrets):
 import hmac
 import json
 import os
+import random
 import re
 import time
 import urllib.error
@@ -248,8 +249,8 @@ def latest_shorts_or_videos(channel_id: str, n: int = NUM_VIDEOS):
     return scrape_tab(channel_id, "videos", n, log), "video", log
 
 
-def get_transcript(video_id: str):
-    """Trả về (văn bản, lỗi). Ưu tiên phụ đề tiếng Anh; nếu không có thì dịch sang Anh."""
+def transcript_via_api(video_id: str):
+    """Trả về (văn bản, lỗi) bằng youtube-transcript-api. Ưu tiên phụ đề tiếng Anh; nếu không có thì dịch sang Anh."""
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
     except Exception as e:
@@ -274,6 +275,61 @@ def get_transcript(video_id: str):
         return text, ("" if text else "Phụ đề rỗng.")
     except Exception as e:
         return "", f"{type(e).__name__}: {str(e).strip()[:300]}"
+
+
+def transcript_via_ytdlp(video_id: str):
+    """Phương án dự phòng: yt-dlp. Trả về (văn bản, lỗi)."""
+    try:
+        import yt_dlp
+    except Exception as e:
+        return "", f"Chưa cài yt-dlp ({e})"
+    try:
+        opts = {"skip_download": True, "quiet": True, "no_warnings": True}
+        proxy = st.secrets.get("PROXY_URL", "")
+        if proxy:
+            opts["proxy"] = proxy
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(
+                f"https://www.youtube.com/watch?v={video_id}", download=False
+            )
+            tracks = None
+            for group in (info.get("subtitles") or {}, info.get("automatic_captions") or {}):
+                for lang, fmts in group.items():
+                    if lang.startswith("en") and fmts:
+                        tracks = fmts
+                        break
+                if tracks:
+                    break
+            if not tracks:
+                return "", "Video không có phụ đề tiếng Anh."
+            fmt = next((f for f in tracks if f.get("ext") == "json3"), None)
+            if not fmt:
+                return "", "Không có định dạng phụ đề json3."
+            raw = ydl.urlopen(fmt["url"]).read().decode("utf-8", errors="replace")
+        if not raw.strip():
+            return "", "YouTube trả về phụ đề rỗng (có thể cần PoToken)."
+        data = json.loads(raw)
+        parts = []
+        for ev in data.get("events", []):
+            seg = "".join(sg.get("utf8", "") for sg in ev.get("segs", []) or [])
+            seg = seg.replace("\n", " ").strip()
+            if seg:
+                parts.append(seg)
+        text = " ".join(parts).strip()
+        return text, ("" if text else "Phụ đề rỗng.")
+    except Exception as e:
+        return "", f"{type(e).__name__}: {str(e).strip()[:300]}"
+
+
+def get_transcript(video_id: str):
+    """Thử youtube-transcript-api, rồi yt-dlp. Trả về (văn bản, lỗi)."""
+    text, err1 = transcript_via_api(video_id)
+    if text:
+        return text, ""
+    text, err2 = transcript_via_ytdlp(video_id)
+    if text:
+        return text, ""
+    return "", f"[youtube-transcript-api] {err1}\n[yt-dlp] {err2}"
 
 
 # ----------------------------------------------------------------------------
@@ -433,6 +489,28 @@ def sidebar():
     st.sidebar.header("📺 Kênh học tiếng Anh")
     channels = load_channels()
 
+    # --- Lấy ngẫu nhiên 1 bài từ một kênh bất kỳ trong cac_kenh.json ---
+    if st.sidebar.button("🎲 Lấy ngẫu nhiên 1 bài", disabled=not channels):
+        pick = random.choice(channels)
+        head = f"Kênh: {pick['name']} ({pick['id']})"
+        try:
+            with st.spinner(f"Đang tìm bài mới nhất của {pick['name']}..."):
+                vids, kind, log = latest_shorts_or_videos(pick["id"], n=1)
+            st.session_state.search_log = [head] + log
+            if vids:
+                st.session_state.search_failed = False
+                st.session_state.videos = vids
+                st.session_state.videos_kind = kind
+                st.session_state.videos_channel = pick["name"]
+                st.session_state.picked_vid = vids[0]["id"]  # phát ngay trong iframe
+                st.session_state.sel_id = pick["id"]         # tích chọn kênh này trong bảng
+                st.session_state.kenh_v += 1
+            else:
+                st.session_state.search_failed = True
+        except Exception as e:
+            st.session_state.search_log = [head, f"Ngoại lệ: {type(e).__name__}: {e}"]
+            st.session_state.search_failed = True
+
     # --- Thêm kênh (bắt buộc nếu chưa có kênh nào) ---
     if not channels:
         st.sidebar.info(
@@ -547,17 +625,11 @@ def sidebar():
         titles = {v["id"]: v["title"] for v in st.session_state.videos}
         st.sidebar.radio(
             "Chọn một bài",
-            ids,    # là list 3 id video/short mới nhất
+            ids,
             index=None,
             format_func=lambda i: titles[i],
             key="picked_vid",
         )
-
-        if len(ids)>0:
-            st.sidebar.write("---")
-            st.sidebar.write(":red[Nếu muốn mở trực tiếp:]")
-            for j in range(len(ids)):
-                st.sidebar.write("https://www.youtube.com/watch?v="+ids[j])
 
 
 # ----------------------------------------------------------------------------

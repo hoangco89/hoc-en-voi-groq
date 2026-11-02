@@ -2,3 +2,4 @@ streamlit>=1.40
 groq
 youtube-transcript-api>=1.0
 pandas
+yt-dlp
