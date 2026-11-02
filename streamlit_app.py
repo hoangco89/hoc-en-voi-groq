@@ -501,7 +501,6 @@ def sidebar():
     if st.sidebar.button("🎲 Lấy ngẫu nhiên bài", disabled=not channels):
         st.session_state.count += 1
         pick = channels[st.session_state.lcsA[st.session_state.count]]
-        st.write(st.session_state.count, pick)
         head = f"Kênh: {pick['name']} ({pick['id']})"
         if st.session_state.count == len(channels)-1:
             st.session_state.count = -1
