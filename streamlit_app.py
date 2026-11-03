@@ -8,7 +8,9 @@ Secrets cần có (Streamlit Cloud -> App settings -> Secrets):
     GROQ_API_KEY = "gsk_..."
 """
 
+import base64
 import hmac
+import html as htmllib
 import json
 import os
 import random
@@ -31,7 +33,7 @@ KENH_FILE = "cac_kenh.json"
 CHAT_MODEL = "qwen/qwen3.8-27b"   # đổi nếu Groq ngừng model này
 STT_MODEL = "whisper-large-v3-turbo"     # nhận dạng giọng nói
 MAX_CONTEXT_CHARS = 12000                # giới hạn độ dài phụ đề gửi cho Groq
-NUM_VIDEOS = 3
+NUM_VIDEOS = 5
 
 NS = {
     "atom": "http://www.w3.org/2005/Atom",
@@ -43,7 +45,7 @@ UA = (
 )
 
 st.set_page_config(
-    page_title="Learn English from Shorts with SI",
+    page_title="Học tiếng Anh từ Shorts với AI",
     page_icon="🎧",
     layout="centered",
     initial_sidebar_state="expanded",
@@ -82,7 +84,7 @@ init_state()
 def check_password() -> bool:
     if st.session_state.auth:
         return True
-    st.title("🎧 Học tiếng Anh từ video với AI")
+    st.header("🎧 Học tiếng Anh từ Shorts với AI")
     expected = st.secrets.get("APP_PASSWORD", "")
     if not expected:
         st.error("Chưa đặt APP_PASSWORD trong Secrets của Streamlit.")
@@ -100,7 +102,73 @@ def check_password() -> bool:
 # ----------------------------------------------------------------------------
 # DANH SÁCH KÊNH (cac_kenh.json)
 # ----------------------------------------------------------------------------
+def gh_cfg():
+    """Cấu hình GitHub từ Secrets; None nếu không dùng GitHub (lưu tệp cục bộ)."""
+    token = st.secrets.get("GITHUB_TOKEN", "")
+    repo = st.secrets.get("GITHUB_REPO", "")  # dạng "ten-nguoi-dung/ten-repo"
+    if not token or not repo:
+        return None
+    return {
+        "token": token,
+        "repo": repo,
+        "branch": st.secrets.get("GITHUB_BRANCH", "main"),
+        "path": st.secrets.get("GITHUB_PATH", KENH_FILE),
+    }
+
+
+def gh_call(cfg: dict, method: str, body: dict = None) -> dict:
+    url = f"https://api.github.com/repos/{cfg['repo']}/contents/{cfg['path']}"
+    if method == "GET":
+        url += "?ref=" + urllib.parse.quote(cfg["branch"], safe="")
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8") if body is not None else None,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {cfg['token']}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "streamlit-english-app",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def gh_error_text(e: Exception) -> str:
+    if isinstance(e, urllib.error.HTTPError):
+        try:
+            msg = json.loads(e.read().decode("utf-8")).get("message", "")
+        except Exception:
+            msg = ""
+        return f"GitHub HTTP {e.code}: {msg}"
+    return f"{type(e).__name__}: {e}"
+
+
 def load_channels() -> list:
+    cfg = gh_cfg()
+    if cfg:
+        if "channels_cache" not in st.session_state:
+            try:
+                info = gh_call(cfg, "GET")
+                raw = base64.b64decode(info["content"]).decode("utf-8")
+                data = json.loads(raw)
+                st.session_state.channels_cache = data if isinstance(data, list) else []
+                st.session_state.gh_sha = info.get("sha")
+                st.session_state.gh_error = ""
+            except urllib.error.HTTPError as e:
+                if e.code == 404:  # tệp chưa có -> sẽ được tạo khi thêm kênh đầu tiên
+                    st.session_state.channels_cache = []
+                    st.session_state.gh_sha = None
+                    st.session_state.gh_error = ""
+                else:
+                    st.session_state.gh_error = gh_error_text(e)
+            except Exception as e:
+                st.session_state.gh_error = gh_error_text(e)
+        return list(st.session_state.get("channels_cache", []))
+
+    # Không cấu hình GitHub -> dùng tệp cục bộ (mất khi Streamlit Cloud khởi động lại)
     if not os.path.exists(KENH_FILE):
         save_channels([])  # tạo tệp mới
         return []
@@ -113,8 +181,42 @@ def load_channels() -> list:
 
 
 def save_channels(channels: list):
+    cfg = gh_cfg()
+    if cfg:
+        if "channels_cache" not in st.session_state:
+            raise RuntimeError("Chưa tải được danh sách từ GitHub, hãy bấm 'Tải lại danh sách'.")
+        body = {
+            "message": "Cập nhật cac_kenh.json từ app",
+            "content": base64.b64encode(
+                json.dumps(channels, ensure_ascii=False, indent=2).encode("utf-8")
+            ).decode("ascii"),
+            "branch": cfg["branch"],
+        }
+        if st.session_state.get("gh_sha"):
+            body["sha"] = st.session_state.gh_sha
+        try:
+            res = gh_call(cfg, "PUT", body)
+        except urllib.error.HTTPError as e:
+            if e.code in (409, 422):  # danh sách đã đổi ở nơi khác
+                st.session_state.pop("channels_cache", None)
+                raise RuntimeError(
+                    "Danh sách trên GitHub đã thay đổi; app đã tải lại, hãy thử thao tác lần nữa."
+                )
+            raise RuntimeError(gh_error_text(e))
+        except Exception as e:
+            raise RuntimeError(gh_error_text(e))
+        st.session_state.channels_cache = list(channels)
+        st.session_state.gh_sha = res.get("content", {}).get("sha")
+        return
     with open(KENH_FILE, "w", encoding="utf-8") as f:
         json.dump(channels, f, ensure_ascii=False, indent=2)
+
+
+def can_write() -> bool:
+    """Nếu có ADMIN_PASSWORD thì cần mở khóa mới được thêm/xóa kênh."""
+    if not st.secrets.get("ADMIN_PASSWORD", ""):
+        return True
+    return bool(st.session_state.get("admin_ok"))
 
 
 # ----------------------------------------------------------------------------
@@ -160,9 +262,38 @@ def fetch_feed(url: str):
         raise
 
 
+def channel_name(channel_id: str, video_id: str = None) -> str:
+    """Lấy tên kênh qua nhiều cách; trả về '' nếu không được."""
+    if video_id:  # oEmbed của video cho biết tên kênh đăng video
+        try:
+            u = urllib.parse.quote(f"https://www.youtube.com/watch?v={video_id}", safe="")
+            data = json.loads(http_get(f"https://www.youtube.com/oembed?format=json&url={u}"))
+            if data.get("author_name"):
+                return data["author_name"]
+        except Exception:
+            pass
+    try:  # RSS của kênh
+        title, _ = fetch_feed(
+            f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+        )
+        if title:
+            return title
+    except Exception:
+        pass
+    try:  # trang kênh
+        page = http_get(f"https://www.youtube.com/channel/{channel_id}")
+        m = re.search(r'<meta property="og:title" content="([^"]+)"', page)
+        if m:
+            return htmllib.unescape(m.group(1)).strip()
+    except Exception:
+        pass
+    return ""
+
+
 def channel_from_link(link: str):
     """Từ link video (hoặc chính id kênh UC...) -> (channel_id, tên kênh)."""
     link = link.strip()
+    vid = None
     if re.fullmatch(r"UC[\w-]{22}", link):
         channel_id = link
     else:
@@ -179,15 +310,7 @@ def channel_from_link(link: str):
             raise ValueError("Không tìm thấy id kênh trong trang video.")
         channel_id = m.group(1)
 
-    name = channel_id
-    try:
-        feed_title, _ = fetch_feed(
-            f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-        )
-        if feed_title:
-            name = feed_title
-    except Exception:
-        pass
+    name = channel_name(channel_id, vid) or channel_id
     return channel_id, name
 
 
@@ -489,24 +612,9 @@ def sidebar():
     st.sidebar.header("📺 Kênh học tiếng Anh")
     channels = load_channels()
 
-    if "lcsA" not in st.session_state:
-        st.session_state.lcsA = [i for i in range(len(channels))]
-        random.shuffle(st.session_state.lcsA)
-
-    if "count" not in st.session_state:
-        st.session_state.count = -1
-
-
     # --- Lấy ngẫu nhiên 1 bài từ một kênh bất kỳ trong cac_kenh.json ---
-    if st.sidebar.button("🎲 Lấy ngẫu nhiên bài", disabled=not channels):
-        st.session_state.count += 1
-        pick = channels[st.session_state.lcsA[st.session_state.count]]
-        head = f"Kênh: {pick['name']} ({pick['id']})"
-        if st.session_state.count == len(channels)-1:
-            st.session_state.count = -1
-            random.shuffle(st.session_state.lcsA)
-
-        #pick = random.choice(channels)
+    if st.sidebar.button("🎲 Lấy ngẫu nhiên 1 bài", disabled=not channels):
+        pick = random.choice(channels)
         head = f"Kênh: {pick['name']} ({pick['id']})"
         try:
             with st.spinner(f"Đang tìm bài mới nhất của {pick['name']}..."):
@@ -526,17 +634,65 @@ def sidebar():
             st.session_state.search_log = [head, f"Ngoại lệ: {type(e).__name__}: {e}"]
             st.session_state.search_failed = True
 
+    # --- Lưu trữ & quyền chỉnh sửa ---
+    if gh_cfg():
+        st.sidebar.caption("☁️ Danh sách kênh lưu trên GitHub")
+        if st.session_state.get("gh_error"):
+            st.sidebar.error(st.session_state.gh_error)
+        if st.sidebar.button("🔄 Tải lại danh sách"):
+            st.session_state.pop("channels_cache", None)
+            st.rerun()
+
+    writable = can_write()
+    if not writable:
+        with st.sidebar.expander("🔐 Mở khóa để thêm/xóa kênh"):
+            apw = st.text_input("Mật mã quản trị", type="password", key="admin_pw")
+            if st.button("Mở khóa"):
+                if hmac.compare_digest(apw.encode(), st.secrets["ADMIN_PASSWORD"].encode()):
+                    st.session_state.admin_ok = True
+                    st.rerun()
+                else:
+                    st.error("Sai mật mã quản trị.")
+
+    # --- Sửa tên cho các kênh đang bị trùng với id ---
+    bad_ids = {c["id"] for c in channels if not c.get("name") or c["name"] == c["id"]}
+    if bad_ids and writable:
+        if st.sidebar.button(f"🔤 Sửa tên cho {len(bad_ids)} kênh"):
+            fixed = 0
+            with st.spinner("Đang lấy tên kênh..."):
+                for c in channels:
+                    if c["id"] in bad_ids:
+                        n = channel_name(c["id"])
+                        if n:
+                            c["name"] = n
+                            fixed += 1
+            if not fixed:
+                st.sidebar.error("Không lấy được tên kênh nào.")
+            else:
+                try:
+                    save_channels(channels)
+                except Exception as e:
+                    st.sidebar.error(f"Không lưu được: {e}")
+                else:
+                    st.session_state.kenh_v += 1
+                    st.rerun()
+
     # --- Thêm kênh (bắt buộc nếu chưa có kênh nào) ---
-    if not channels:
+    if not channels and not st.session_state.get("gh_error"):
         st.sidebar.info(
             "Chưa có kênh nào. Dán 1 link video YouTube của kênh bạn muốn học."
         )
-    with st.sidebar.expander("➕ Thêm kênh", expanded=not channels):
-        link = st.text_input("Link 1 video YouTube (hoặc id kênh UC...)", key="add_link")
-        if st.button("Thêm kênh"):
+    with st.sidebar.expander("➕ Thêm kênh", expanded=(not channels and writable)):
+        if not writable:
+            st.caption("Cần mở khóa bằng mật mã quản trị ở trên.")
+        link = st.text_input(
+            "Link 1 video YouTube (hoặc id kênh UC...)", key="add_link", disabled=not writable
+        )
+        if st.button("Thêm kênh", disabled=not writable):
             try:
                 with st.spinner("Đang lấy id kênh..."):
                     cid, name = channel_from_link(link)
+                    st.write(name)
                 if any(c["id"] == cid for c in channels):
                     st.warning("Kênh này đã có trong danh sách.")
                 else:
@@ -560,7 +716,6 @@ def sidebar():
                 "Tên kênh": str(i+1) + '. ' + c["name"],
                 "Id của kênh": c["id"],
                 "Xóa": c["id"] in del_ids,
-                "Url": "https://www.youtube.com/channel/UCFfinPB9xvedvsi-PlMYeyA"
             }
             for i, c in enumerate(channels)
         ]
@@ -591,17 +746,21 @@ def sidebar():
 
     c1, c2 = st.sidebar.columns(2)
     find_clicked = c1.button("🔎 Tìm video")
-    del_clicked = c2.button("🗑 Xóa kênh")
+    del_clicked = c2.button("🗑 Xóa kênh", disabled=not writable)
 
     if del_clicked:
         to_del = set(st.session_state.del_ids)
         if to_del:
-            save_channels([c for c in channels if c["id"] not in to_del])
-            if st.session_state.sel_id in to_del:
-                st.session_state.sel_id = None
-            st.session_state.del_ids = []
-            st.session_state.kenh_v += 1
-            st.rerun()
+            try:
+                save_channels([c for c in channels if c["id"] not in to_del])
+            except Exception as e:
+                st.sidebar.error(f"Không lưu được: {e}")
+            else:
+                if st.session_state.sel_id in to_del:
+                    st.session_state.sel_id = None
+                st.session_state.del_ids = []
+                st.session_state.kenh_v += 1
+                st.rerun()
         else:
             st.sidebar.warning("Hãy tích cột Xóa ở kênh muốn xóa.")
 
@@ -911,7 +1070,7 @@ def main_screen():
     if not vid:
         st.title("🎧 Tự học tiếng Anh từ Shorts")
         st.info(
-            "👈 Mở thanh bên: bấm **Lấy ngẫu nhiên bài**, hoặc Chọn kênh → bấm **Tìm video** → chọn một bài. "
+            "👈 Mở thanh bên: chọn kênh → bấm **Tìm video** → chọn một bài. "
             "(Trên iPhone, bấm mũi tên ở góc trên bên trái để mở thanh bên.)"
         )
         return
