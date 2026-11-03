@@ -1,5 +1,6 @@
 [
-  {"name": "For Refined Minds",
+  {
+    "name": "For Refined Minds",
     "id": "UCFfinPB9xvedvsi-PlMYeyA"
   },
   {
@@ -17,40 +18,53 @@
   {
     "name": "Speak English Daily",
     "id": "UCO9UXvuNZlM4-wftfAeY-Nw"
-
   },
-  {  "name": "Key to Conversation",
+  {
+    "name": "Key to Conversation",
     "id": "UCxh8DHdLb8jq57hgccGvZSw"
   },
-  {  "name": "English Easy Practice",
+  {
+    "name": "English Easy Practice",
     "id": "UCTvMDjmhpuYU8Wfvf54Fzvw"
   },
-  {  "name": "Best English Teacher",
+  {
+    "name": "Best English Teacher",
     "id": "UCIEIBlSMoebkNFsqHph54yg"
   },
-  {  "name": "Speak_Smart_English",
+  {
+    "name": "Speak_Smart_English",
     "id": "UC8zBCNPY0txsDqpLxOe1jkQ"
   },
-  {  "name": "Devano Kids",
+  {
+    "name": "Devano Kids",
     "id": "UCMXn4E0qh6AsUQ7xXveO9VQ"
   },
-  {  "name": "English by Giovana",
+  {
+    "name": "English by Giovana",
     "id": "UCiwfO0dY4kB-fzwBYqFGFNg"
   },
-  {  "name": "English with Grandma & Grandpa",
+  {
+    "name": "English with Grandma & Grandpa",
     "id": "UC4yaOvcIJCBMyjohh_7qWJA"
   },
-  {  "name": "Unlock English Podcast",
+  {
+    "name": "Unlock English Podcast",
     "id": "UCkpeAkm7Cpnua4oSx1qmWhQ"
   },
-  {  "name": "Elliot Rush",
+  {
+    "name": "Elliot Rush",
     "id": "UCdGBl18qYe5UeEA7zIoQiaQ"
+  },
+  {
+    "name": "The Open Minds Studio",
+    "id": "UCRhgIJnrW_ZF8NAb-ywGLYw"
   },
   {
     "name": "English Online",
     "id": "UCvHjQM6eIGQNqtrjn_gmPRQ"
+  },
+  {
+    "name": "Easy English",
+    "id": "UC9KLuQlWu6xv6krrgroFIYQ"
   }
-
 ]
-
-
