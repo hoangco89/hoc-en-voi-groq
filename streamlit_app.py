@@ -743,11 +743,12 @@ def sidebar():
         [
             {
                 "Chọn": c["id"] == sel_id,
-                "Tên kênh": c["name"],
+                "Tên kênh": str(i+1) + '. ' + c["name"],
                 "Id của kênh": c["id"],
                 "Xóa": c["id"] in del_ids,
             }
-            for c in channels
+            for i, c in enumerate(channels)
+
         ]
     )
     edited = st.sidebar.data_editor(
