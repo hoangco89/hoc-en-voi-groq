@@ -33,7 +33,7 @@ KENH_FILE = "cac_kenh.json"
 CHAT_MODEL = "qwen/qwen3.8-27b"   # đổi nếu Groq ngừng model này
 STT_MODEL = "whisper-large-v3-turbo"     # nhận dạng giọng nói
 MAX_CONTEXT_CHARS = 12000                # giới hạn độ dài phụ đề gửi cho Groq
-NUM_VIDEOS = 5
+NUM_VIDEOS = 6
 
 NS = {
     "atom": "http://www.w3.org/2005/Atom",
@@ -45,7 +45,7 @@ UA = (
 )
 
 st.set_page_config(
-    page_title="Học tiếng Anh từ Shorts với AI",
+    page_title="Tự học tiếng Anh từ Shorts",
     page_icon="🎧",
     layout="centered",
     initial_sidebar_state="expanded",
@@ -84,7 +84,7 @@ init_state()
 def check_password() -> bool:
     if st.session_state.auth:
         return True
-    st.header("🎧 Học tiếng Anh từ Shorts với AI")
+    st.title("🎧 Tự học tiếng Anh từ Shorts")
     expected = st.secrets.get("APP_PASSWORD", "")
     if not expected:
         st.error("Chưa đặt APP_PASSWORD trong Secrets của Streamlit.")
@@ -608,6 +608,36 @@ def speak_buttons(text: str, lang: str = "en-US"):
 # ----------------------------------------------------------------------------
 # SIDEBAR
 # ----------------------------------------------------------------------------
+def oembed_info(vid: str):
+    """(tiêu đề, tên kênh, có phải video dọc/Shorts không) qua oEmbed."""
+    try:
+        u = urllib.parse.quote(f"https://www.youtube.com/watch?v={vid}", safe="")
+        d = json.loads(http_get(f"https://www.youtube.com/oembed?format=json&url={u}"))
+        vertical = (d.get("height") or 0) > (d.get("width") or 1)
+        return d.get("title") or vid, d.get("author_name") or "", vertical
+    except Exception:
+        return vid, "", False
+
+
+def paste_link_block():
+    """Dán link bất kỳ video/Shorts YouTube để phát trong iframe."""
+    link = st.sidebar.text_input(
+        "Dán link video/Shorts YouTube", key="paste_link", placeholder="https://youtu.be/..."
+    )
+    if st.sidebar.button("🔗 Lấy bài với link dán vào"):
+        vid = extract_video_id(link or "")
+        if not vid:
+            st.sidebar.error("Link không hợp lệ. Hãy dán link của một video hoặc Shorts.")
+            return
+        with st.spinner("Đang lấy thông tin bài..."):
+            title, author, vertical = oembed_info(vid)
+        st.session_state.videos = [{"id": vid, "title": title}]
+        st.session_state.videos_kind = "short" if ("/shorts/" in link or vertical) else "video"
+        st.session_state.videos_channel = author or "Link dán vào"
+        st.session_state.picked_vid = vid
+        st.session_state.search_failed = False
+
+
 def sidebar():
     st.sidebar.header("📺 Kênh học tiếng Anh")
     channels = load_channels()
@@ -692,7 +722,6 @@ def sidebar():
             try:
                 with st.spinner("Đang lấy id kênh..."):
                     cid, name = channel_from_link(link)
-                    st.write(name)
                 if any(c["id"] == cid for c in channels):
                     st.warning("Kênh này đã có trong danh sách.")
                 else:
@@ -704,6 +733,7 @@ def sidebar():
                 st.error(f"Lỗi: {e}")
 
     if not channels:
+        paste_link_block()
         return
 
     # --- Bảng chọn kênh (chỉ cho chọn 1 kênh) ---
@@ -713,11 +743,11 @@ def sidebar():
         [
             {
                 "Chọn": c["id"] == sel_id,
-                "Tên kênh": str(i+1) + '. ' + c["name"],
+                "Tên kênh": c["name"],
                 "Id của kênh": c["id"],
                 "Xóa": c["id"] in del_ids,
             }
-            for i, c in enumerate(channels)
+            for c in channels
         ]
     )
     edited = st.sidebar.data_editor(
@@ -744,9 +774,19 @@ def sidebar():
     if not checked:
         st.session_state.sel_id = None
 
-    c1, c2 = st.sidebar.columns(2)
+    paste_link_block()
+
+    c1, c2, c3 = st.sidebar.columns(3)
     find_clicked = c1.button("🔎 Tìm video")
     del_clicked = c2.button("🗑 Xóa kênh", disabled=not writable)
+
+    sel_ch = next((c for c in channels if c["id"] == st.session_state.sel_id), None)
+    c3.link_button(
+        "📺 Xem kênh",
+        f"https://www.youtube.com/channel/{sel_ch['id']}" if sel_ch else "https://www.youtube.com",
+        disabled=sel_ch is None,
+        help="Xem trực tiếp kênh đã chọn trên YouTube",
+    )
 
     if del_clicked:
         to_del = set(st.session_state.del_ids)
