@@ -1,1163 +1,351 @@
-# -*- coding: utf-8 -*-
-"""
-Tự học tiếng Anh từ Shorts YouTube với Groq AI
-Triển khai trên Streamlit Cloud. Ưu tiên iPhone (Safari), chạy tốt trên laptop.
-
-Secrets cần có (Streamlit Cloud -> App settings -> Secrets):
-    APP_PASSWORD = "mat-ma-cua-ban"
-    GROQ_API_KEY = "gsk_..."
-"""
-
-import base64
-import hmac
-import html as htmllib
-import json
-import os
-import random
+# streamlit_app.py - Hỏi đáp với Groq: ô nhập tùy biến (bàn phím / micro), trả lời bằng chữ + giọng đọc
+import io
 import re
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-import xml.etree.ElementTree as ET
+import tempfile
+from pathlib import Path
 
-import pandas as pd
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
-from groq import Groq
+from gtts import gTTS
 
-# ----------------------------------------------------------------------------
-# CẤU HÌNH
-# ----------------------------------------------------------------------------
-KENH_FILE = "cac_kenh.json"
-CHAT_MODEL = "qwen/qwen3.8-27b"   # đổi nếu Groq ngừng model này
-STT_MODEL = "whisper-large-v3-turbo"     # nhận dạng giọng nói
-MAX_CONTEXT_CHARS = 12000                # giới hạn độ dài phụ đề gửi cho Groq
-NUM_VIDEOS = 6
+st.set_page_config(page_title="Hỏi đáp với Groq AI")
+st.header("Hỏi đáp với Groq AI")
 
-NS = {
-    "atom": "http://www.w3.org/2005/Atom",
-    "yt": "http://www.youtube.com/xml/schemas/2015",
-}
-UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/17.0 Safari/605.1.15"
-)
-
-st.set_page_config(
-    page_title="Tự học tiếng Anh từ Shorts",
-    page_icon="🎧",
-    layout="centered",
-    initial_sidebar_state="expanded",
-)
-
-# ----------------------------------------------------------------------------
-# TRẠNG THÁI
-# ----------------------------------------------------------------------------
-def init_state():
-    defaults = {
-        "auth": False,
-        "kenh_v": 0,              # đổi key của bảng kênh sau khi sửa
-        "sel_id": None,           # id kênh đang được chọn (chỉ 1)
-        "del_ids": [],            # id kênh đang được tích Xóa
-        "videos": [],             # [{id, title}]
-        "videos_kind": "",        # "short" | "video"
-        "videos_channel": "",
-        "transcripts": {},        # video_id -> text
-        "tr_err": {},             # video_id -> lỗi lấy phụ đề
-        "summaries": {},          # video_id -> {"en": .., "vi": ..}
-        "read_result": {},        # video_id -> nhận xét đọc
-        "gq": {},                 # video_id -> câu hỏi hiện tại của Groq
-        "gq_result": {},          # video_id -> nhận xét câu trả lời
-        "chat": {},               # video_id -> [{"q","en","vi"}]
-        "rec_n": 0,               # đếm để xóa các ô ghi âm/nhập sau khi gửi
-    }
-    for k, v in defaults.items():
-        st.session_state.setdefault(k, v)
-
-
-init_state()
-
-# ----------------------------------------------------------------------------
-# MẬT MÃ
-# ----------------------------------------------------------------------------
-def check_password() -> bool:
-    if st.session_state.auth:
-        return True
-    st.title("🎧 Tự học tiếng Anh từ Shorts")
-    expected = st.secrets.get("APP_PASSWORD", "")
-    if not expected:
-        st.error("Chưa đặt APP_PASSWORD trong Secrets của Streamlit.")
-        return False
-    pw = st.text_input("Nhập mật mã để tiếp tục", type="password")
-    if st.button("Vào"):
-        if hmac.compare_digest(pw.encode(), expected.encode()):
-            st.session_state.auth = True
+# ---------- Cổng mật khẩu (chỉ bật nếu có APP_PASSWORD trong Secrets) ----------
+pw_required = st.secrets.get("APP_PASSWORD")
+if pw_required and not st.session_state.get("ok"):
+    pw = st.text_input("Mật khẩu", type="password")
+    if pw:
+        if pw == pw_required:
+            st.session_state.ok = True
             st.rerun()
         else:
-            st.error("Sai mật mã.")
-    return False
+            st.error("Sai mật khẩu.")
+    st.stop()
 
+# ---------- Cấu hình ----------
+API_KEY = st.secrets.get("GROQ_API_KEY")
+MODEL = st.secrets.get("GROQ_MODEL", "qwen/qwen3.8-27b")
 
-# ----------------------------------------------------------------------------
-# DANH SÁCH KÊNH (cac_kenh.json)
-# ----------------------------------------------------------------------------
-def gh_cfg():
-    """Cấu hình GitHub từ Secrets; None nếu không dùng GitHub (lưu tệp cục bộ)."""
-    token = st.secrets.get("GITHUB_TOKEN", "")
-    repo = st.secrets.get("GITHUB_REPO", "")  # dạng "ten-nguoi-dung/ten-repo"
-    if not token or not repo:
-        return None
-    return {
-        "token": token,
-        "repo": repo,
-        "branch": st.secrets.get("GITHUB_BRANCH", "main"),
-        "path": st.secrets.get("GITHUB_PATH", KENH_FILE),
-    }
+if not API_KEY:
+    st.error("Thiếu GROQ_API_KEY trong Secrets.")
+    st.stop()
 
+GROQ = "https://api.groq.com/openai/v1"
+# tên hiển thị: (mã cho giọng đọc gTTS, mã cho nhận diện giọng nói của trình duyệt)
+LANGS = {
+    "Tiếng Việt": ("vi", "vi-VN"),
+    "English": ("en", "en-US"),
+    "Français": ("fr", "fr-FR"),
+    "Dansk": ("da", "da-DK"),
+}
 
-def gh_call(cfg: dict, method: str, body: dict = None) -> dict:
-    url = f"https://api.github.com/repos/{cfg['repo']}/contents/{cfg['path']}"
-    if method == "GET":
-        url += "?ref=" + urllib.parse.quote(cfg["branch"], safe="")
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8") if body is not None else None,
-        method=method,
-        headers={
-            "Authorization": f"Bearer {cfg['token']}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "streamlit-english-app",
-            "Content-Type": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+if "history" not in st.session_state:
+    st.session_state.history = []
 
-
-def gh_error_text(e: Exception) -> str:
-    if isinstance(e, urllib.error.HTTPError):
-        try:
-            msg = json.loads(e.read().decode("utf-8")).get("message", "")
-        except Exception:
-            msg = ""
-        return f"GitHub HTTP {e.code}: {msg}"
-    return f"{type(e).__name__}: {e}"
-
-
-def load_channels() -> list:
-    cfg = gh_cfg()
-    if cfg:
-        if "channels_cache" not in st.session_state:
-            try:
-                info = gh_call(cfg, "GET")
-                raw = base64.b64decode(info["content"]).decode("utf-8")
-                data = json.loads(raw)
-                st.session_state.channels_cache = data if isinstance(data, list) else []
-                st.session_state.gh_sha = info.get("sha")
-                st.session_state.gh_error = ""
-            except urllib.error.HTTPError as e:
-                if e.code == 404:  # tệp chưa có -> sẽ được tạo khi thêm kênh đầu tiên
-                    st.session_state.channels_cache = []
-                    st.session_state.gh_sha = None
-                    st.session_state.gh_error = ""
-                else:
-                    st.session_state.gh_error = gh_error_text(e)
-            except Exception as e:
-                st.session_state.gh_error = gh_error_text(e)
-        return list(st.session_state.get("channels_cache", []))
-
-    # Không cấu hình GitHub -> dùng tệp cục bộ (mất khi Streamlit Cloud khởi động lại)
-    if not os.path.exists(KENH_FILE):
-        save_channels([])  # tạo tệp mới
-        return []
-    try:
-        with open(KENH_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-
-def save_channels(channels: list):
-    cfg = gh_cfg()
-    if cfg:
-        if "channels_cache" not in st.session_state:
-            raise RuntimeError("Chưa tải được danh sách từ GitHub, hãy bấm 'Tải lại danh sách'.")
-        body = {
-            "message": "Cập nhật cac_kenh.json từ app",
-            "content": base64.b64encode(
-                json.dumps(channels, ensure_ascii=False, indent=2).encode("utf-8")
-            ).decode("ascii"),
-            "branch": cfg["branch"],
-        }
-        if st.session_state.get("gh_sha"):
-            body["sha"] = st.session_state.gh_sha
-        try:
-            res = gh_call(cfg, "PUT", body)
-        except urllib.error.HTTPError as e:
-            if e.code in (409, 422):  # danh sách đã đổi ở nơi khác
-                st.session_state.pop("channels_cache", None)
-                raise RuntimeError(
-                    "Danh sách trên GitHub đã thay đổi; app đã tải lại, hãy thử thao tác lần nữa."
-                )
-            raise RuntimeError(gh_error_text(e))
-        except Exception as e:
-            raise RuntimeError(gh_error_text(e))
-        st.session_state.channels_cache = list(channels)
-        st.session_state.gh_sha = res.get("content", {}).get("sha")
-        return
-    with open(KENH_FILE, "w", encoding="utf-8") as f:
-        json.dump(channels, f, ensure_ascii=False, indent=2)
-
-
-def can_write() -> bool:
-    """Nếu có ADMIN_PASSWORD thì cần mở khóa mới được thêm/xóa kênh."""
-    if not st.secrets.get("ADMIN_PASSWORD", ""):
-        return True
-    return bool(st.session_state.get("admin_ok"))
-
-
-# ----------------------------------------------------------------------------
-# YOUTUBE (không cần API key)
-# ----------------------------------------------------------------------------
-def http_get(url: str, timeout: int = 15) -> str:
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": UA,
-            "Accept-Language": "en-US,en;q=0.9",
-            "Cookie": "CONSENT=YES+1; SOCS=CAI",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", errors="replace")
-
-
-def extract_video_id(url: str):
-    m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/|live/)([\w-]{11})", url)
-    return m.group(1) if m else None
-
-
-def parse_feed(xml_text: str):
-    root = ET.fromstring(xml_text)
-    title = root.findtext("atom:title", default="", namespaces=NS)
-    items = []
-    for entry in root.findall("atom:entry", NS):
-        vid = entry.findtext("yt:videoId", default="", namespaces=NS)
-        ttl = entry.findtext("atom:title", default="", namespaces=NS)
-        if vid:
-            items.append({"id": vid, "title": ttl or vid})
-    return title, items
-
-
-def fetch_feed(url: str):
-    """Trả về (tên_feed, danh_sách_video). 404 -> ('', [])."""
-    try:
-        return parse_feed(http_get(url))
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return "", []
-        raise
-
-
-def channel_name(channel_id: str, video_id: str = None) -> str:
-    """Lấy tên kênh qua nhiều cách; trả về '' nếu không được."""
-    if video_id:  # oEmbed của video cho biết tên kênh đăng video
-        try:
-            u = urllib.parse.quote(f"https://www.youtube.com/watch?v={video_id}", safe="")
-            data = json.loads(http_get(f"https://www.youtube.com/oembed?format=json&url={u}"))
-            if data.get("author_name"):
-                return data["author_name"]
-        except Exception:
-            pass
-    try:  # RSS của kênh
-        title, _ = fetch_feed(
-            f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-        )
-        if title:
-            return title
-    except Exception:
-        pass
-    try:  # trang kênh
-        page = http_get(f"https://www.youtube.com/channel/{channel_id}")
-        m = re.search(r'<meta property="og:title" content="([^"]+)"', page)
-        if m:
-            return htmllib.unescape(m.group(1)).strip()
-    except Exception:
-        pass
-    return ""
-
-
-def channel_from_link(link: str):
-    """Từ link video (hoặc chính id kênh UC...) -> (channel_id, tên kênh)."""
-    link = link.strip()
-    vid = None
-    if re.fullmatch(r"UC[\w-]{22}", link):
-        channel_id = link
-    else:
-        vid = extract_video_id(link)
-        if not vid:
-            raise ValueError("Không nhận ra link video YouTube.")
-        page = http_get(f"https://www.youtube.com/watch?v={vid}")
-        m = (
-            re.search(r'itemprop="channelId" content="(UC[\w-]{22})"', page)
-            or re.search(r'"externalChannelId":"(UC[\w-]{22})"', page)
-            or re.search(r'"channelId":"(UC[\w-]{22})"', page)
-        )
-        if not m:
-            raise ValueError("Không tìm thấy id kênh trong trang video.")
-        channel_id = m.group(1)
-
-    name = channel_name(channel_id, vid) or channel_id
-    return channel_id, name
-
-
-def try_feed(url: str, label: str, log: list):
-    """Đọc RSS, thử lại 1 lần (YouTube thỉnh thoảng trả 404/5xx tạm thời)."""
-    for _ in range(2):
-        try:
-            _, items = parse_feed(http_get(url))
-            log.append(f"{label}: OK, {len(items)} mục")
-            return items
-        except urllib.error.HTTPError as e:
-            log.append(f"{label}: HTTP {e.code}")
-        except Exception as e:
-            log.append(f"{label}: {type(e).__name__}: {str(e)[:120]}")
-        time.sleep(1)
-    return []
-
-
-def video_title(vid: str) -> str:
-    try:
-        u = urllib.parse.quote(f"https://www.youtube.com/watch?v={vid}", safe="")
-        data = json.loads(http_get(f"https://www.youtube.com/oembed?format=json&url={u}"))
-        return data.get("title") or vid
-    except Exception:
-        return vid
-
-
-def scrape_tab(channel_id: str, tab: str, n: int, log: list):
-    """Phương án dự phòng: đọc trang /shorts hoặc /videos của kênh."""
-    try:
-        html = http_get(f"https://www.youtube.com/channel/{channel_id}/{tab}")
-    except Exception as e:
-        log.append(f"trang /{tab}: {type(e).__name__}: {str(e)[:120]}")
-        return []
-    ids = list(dict.fromkeys(re.findall(r'"videoId":"([\w-]{11})"', html)))[:n]
-    log.append(f"trang /{tab}: tìm thấy {len(ids)} id")
-    return [{"id": i, "title": video_title(i)} for i in ids]
-
-
-def latest_shorts_or_videos(channel_id: str, n: int = NUM_VIDEOS):
-    """n Shorts mới nhất; nếu kênh không có Shorts thì n video mới nhất.
-    Trả về (danh_sách, loại, nhật_ký)."""
-    log = []
-    items = try_feed(
-        f"https://www.youtube.com/feeds/videos.xml?playlist_id=UUSH{channel_id[2:]}",
-        "RSS Shorts", log,
-    )
-    if items:
-        return items[:n], "short", log
-    items = scrape_tab(channel_id, "shorts", n, log)
-    if items:
-        return items, "short", log
-    items = try_feed(
-        f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}",
-        "RSS kênh", log,
-    )
-    if items:
-        return items[:n], "video", log
-    return scrape_tab(channel_id, "videos", n, log), "video", log
-
-
-def transcript_via_api(video_id: str):
-    """Trả về (văn bản, lỗi) bằng youtube-transcript-api. Ưu tiên phụ đề tiếng Anh; nếu không có thì dịch sang Anh."""
-    try:
-        from youtube_transcript_api import YouTubeTranscriptApi
-    except Exception as e:
-        return "", f"Chưa cài youtube-transcript-api>=1.0 ({e})"
-    try:
-        kwargs = {}
-        proxy = st.secrets.get("PROXY_URL", "")  # tùy chọn, xem hướng dẫn
-        if proxy:
-            from youtube_transcript_api.proxies import GenericProxyConfig
-
-            kwargs["proxy_config"] = GenericProxyConfig(http_url=proxy, https_url=proxy)
-        api = YouTubeTranscriptApi(**kwargs)
-        tlist = api.list(video_id)
-        try:
-            t = tlist.find_transcript(["en", "en-US", "en-GB"])  # thủ công hoặc tự động
-        except Exception:
-            t = next(iter(tlist))  # ngôn ngữ bất kỳ
-            if not t.language_code.startswith("en") and t.is_translatable:
-                t = t.translate("en")
-        fetched = t.fetch()
-        text = " ".join(sn.text for sn in fetched).strip()
-        return text, ("" if text else "Phụ đề rỗng.")
-    except Exception as e:
-        return "", f"{type(e).__name__}: {str(e).strip()[:300]}"
-
-
-def transcript_via_ytdlp(video_id: str):
-    """Phương án dự phòng: yt-dlp. Trả về (văn bản, lỗi)."""
-    try:
-        import yt_dlp
-    except Exception as e:
-        return "", f"Chưa cài yt-dlp ({e})"
-    try:
-        opts = {"skip_download": True, "quiet": True, "no_warnings": True}
-        proxy = st.secrets.get("PROXY_URL", "")
-        if proxy:
-            opts["proxy"] = proxy
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(
-                f"https://www.youtube.com/watch?v={video_id}", download=False
-            )
-            tracks = None
-            for group in (info.get("subtitles") or {}, info.get("automatic_captions") or {}):
-                for lang, fmts in group.items():
-                    if lang.startswith("en") and fmts:
-                        tracks = fmts
-                        break
-                if tracks:
-                    break
-            if not tracks:
-                return "", "Video không có phụ đề tiếng Anh."
-            fmt = next((f for f in tracks if f.get("ext") == "json3"), None)
-            if not fmt:
-                return "", "Không có định dạng phụ đề json3."
-            raw = ydl.urlopen(fmt["url"]).read().decode("utf-8", errors="replace")
-        if not raw.strip():
-            return "", "YouTube trả về phụ đề rỗng (có thể cần PoToken)."
-        data = json.loads(raw)
-        parts = []
-        for ev in data.get("events", []):
-            seg = "".join(sg.get("utf8", "") for sg in ev.get("segs", []) or [])
-            seg = seg.replace("\n", " ").strip()
-            if seg:
-                parts.append(seg)
-        text = " ".join(parts).strip()
-        return text, ("" if text else "Phụ đề rỗng.")
-    except Exception as e:
-        return "", f"{type(e).__name__}: {str(e).strip()[:300]}"
-
-
-def get_transcript(video_id: str):
-    """Thử youtube-transcript-api, rồi yt-dlp. Trả về (văn bản, lỗi)."""
-    text, err1 = transcript_via_api(video_id)
-    if text:
-        return text, ""
-    text, err2 = transcript_via_ytdlp(video_id)
-    if text:
-        return text, ""
-    return "", f"[youtube-transcript-api] {err1}\n[yt-dlp] {err2}"
-
-
-# ----------------------------------------------------------------------------
-# GROQ
-# ----------------------------------------------------------------------------
-@st.cache_resource
-def groq_client() -> Groq:
-    return Groq(api_key=st.secrets["GROQ_API_KEY"])
-
-
-def groq_chat(messages, temperature=0.4, json_mode=False) -> str:
-    kwargs = {}
-    if json_mode:
-        kwargs["response_format"] = {"type": "json_object"}
-    r = groq_client().chat.completions.create(
-        model=CHAT_MODEL, messages=messages, temperature=temperature, **kwargs
-    )
-    return r.choices[0].message.content.strip()
-
-
-def groq_json(messages, temperature=0.3) -> dict:
-    raw = groq_chat(messages, temperature=temperature, json_mode=True)
-    try:
-        return json.loads(raw)
-    except Exception:
-        return {"en": raw, "vi": ""}
-
-
-def transcribe(audio_bytes: bytes, filename: str = "speech.wav") -> str:
-    r = groq_client().audio.transcriptions.create(
-        file=(filename, audio_bytes),
-        model=STT_MODEL,
-        language="en",
-    )
-    return (getattr(r, "text", None) or str(r)).strip()
-
-
-SYSTEM_TUTOR = (
-    "Bạn là gia sư tiếng Anh thân thiện cho người Việt (trình độ A2-B1). "
-    "Nhận xét bằng tiếng Việt, ví dụ và câu mẫu bằng tiếng Anh đơn giản. "
-    "Ngắn gọn, cụ thể, khích lệ."
-)
-
-
-def lesson_context(video_id: str, title: str) -> str:
-    text = st.session_state.transcripts.get(video_id, "")[:MAX_CONTEXT_CHARS]
-    summ = st.session_state.summaries.get(video_id)
-    ctx = f"Video title: {title}\n"
-    if text:
-        ctx += f"Transcript:\n{text}\n"
-    if summ:
-        ctx += f"English summary:\n{summ['en']}\n"
-    return ctx
-
-
-# ----------------------------------------------------------------------------
-# THÀNH PHẦN GIAO DIỆN (HTML)
-# ----------------------------------------------------------------------------
-PLAYER_TEMPLATE = """
+# ---------- Ô nhập tùy biến (HTML/JS chạy trong trình duyệt) ----------
+COMPONENT_HTML = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  body { margin:0; font-family:-apple-system,system-ui,sans-serif; }
-  #wrap { max-width:__MAXW__px; margin:0 auto; }
-  #box { position:relative; width:100%; aspect-ratio:__RATIO__; background:#000;
-         border-radius:12px; overflow:hidden; }
-  #box iframe { position:absolute; inset:0; width:100%; height:100%; border:0; }
-  .bar { display:flex; flex-wrap:wrap; gap:6px; justify-content:center; margin-top:8px; }
-  button { border:1px solid #bbb; background:#f6f6f6; border-radius:8px;
-           padding:8px 10px; font-size:15px; }
-  button.on { background:#ff4b4b; color:#fff; border-color:#ff4b4b; }
-  @media (prefers-color-scheme: dark) {
-    button { background:#2b2b2b; color:#eee; border-color:#555; }
-  }
+  :root { --fg:#31333f; --bg:#ffffff; --bg2:#f0f2f6; --pri:#ff4b4b; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#fafafa; --bg:#0e1117; --bg2:#262730; } }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: transparent; color: var(--fg);
+    font-family: "Source Sans Pro", system-ui, -apple-system, sans-serif; }
+  #wrap { padding: 4px 2px 6px; }
+  #chipRow { display: none; align-items: center; height: 38px; }
+  .chip { display: none; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 999px;
+    background: var(--bg2); border: 1px solid rgba(128,128,128,.4); font-size: 15px;
+    cursor: pointer; user-select: none; -webkit-user-select: none; }
+  .chip.show { display: inline-flex; animation: pop .28s ease-out; }
+  .chip.live { border-color: #dc2626; }
+  .chip.live .em { animation: pulse 1s infinite; }
+  .chip .x { opacity: .6; margin-left: 4px; padding: 0 2px; }
+  @keyframes pop { from { transform: translateY(26px); opacity: 0; } to { transform: none; opacity: 1; } }
+  @keyframes pulse { 50% { opacity: .3; } }
+  #frame { display: flex; align-items: flex-end; gap: 8px; min-height: 66px;
+    border: 1px solid rgba(128,128,128,.5); border-radius: 14px; padding: 8px 8px 8px 12px; background: var(--bg); }
+  #left { flex: 1; min-width: 0; display: flex; align-items: center; align-self: stretch; }
+  #hint { font-size: 15px; line-height: 1.8; }
+  .emo { border: 0; background: var(--bg2); border-radius: 8px; font-size: 18px; padding: 0 7px;
+    cursor: pointer; line-height: 1.5; vertical-align: baseline; }
+  #txt { display: none; width: 100%; border: 0; outline: 0; resize: none; background: transparent;
+    color: var(--fg); font: inherit; font-size: 16px; line-height: 1.4; max-height: 120px; padding: 4px 0; }
+  #send { flex: none; width: 42px; height: 42px; border: 0; border-radius: 50%; background: var(--pri);
+    color: #fff; font-size: 18px; cursor: pointer; }
+  #send:disabled { opacity: .35; cursor: not-allowed; }
 </style>
+</head>
+<body>
 <div id="wrap">
-  <div id="box">
-    <iframe id="yt"
-      src="https://www.youtube.com/embed/__VID__?playsinline=1&enablejsapi=1&rel=0&modestbranding=1&cc_load_policy=__CC__&cc_lang_pref=en&hl=en"
-      allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>
+  <div id="chipRow">
+    <span id="chip" class="chip"><span class="em" id="chipEm"></span><span id="chipTxt"></span><span class="x" id="chipX">✕</span></span>
   </div>
-  <div class="bar" id="speeds"></div>
-  <div class="bar">
-    <button onclick="seekBy(-5)">⏪ 5s</button>
-    <button onclick="replay()">↺ Nghe lại</button>
-    <button onclick="seekBy(5)">5s ⏩</button>
+  <div id="frame">
+    <div id="left">
+      <div id="hint">Bấm <button class="emo" id="btnKb" type="button">⌨️</button>, hoặc bấm <button class="emo" id="btnMic" type="button">🎤</button> để hỏi rồi gửi</div>
+      <textarea id="txt" rows="1"></textarea>
+    </div>
+    <button id="send" type="button" disabled>𖤂</button>
   </div>
 </div>
+
 <script>
-  var f=document.getElementById('yt'), cur=0, rates=[0.5,0.75,1,1.25];
-  function cmd(fn,args){
-    f.contentWindow.postMessage(JSON.stringify({event:'command',func:fn,args:args||[]}),'*');
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var lang = "vi-VN", mode = null, rec = null, listening = false, base = "", hadError = false;
+  var autoSecs = 0, silenceTimer = null, manualStop = false;
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  var isMobile = /iPhone|iPad|Android/i.test(navigator.userAgent);
+  var ERR = {
+    "not-allowed": "Chưa cấp quyền micro",
+    "service-not-allowed": "Chưa bật nhận diện giọng nói (iPhone: bật Đọc chính tả trong Cài đặt)",
+    "no-speech": "Không nghe thấy gì · bấm để thử lại",
+    "audio-capture": "Không tìm thấy micro",
+    "network": "Lỗi mạng khi nhận diện giọng nói",
+    "language-not-supported": "Ngôn ngữ này chưa được hỗ trợ"
+  };
+
+  function post(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*");
   }
-  function listen(){
-    f.contentWindow.postMessage(JSON.stringify({event:'listening',id:1}),'*');
+  function fit() {
+    post("streamlit:setFrameHeight", { height: Math.ceil($("wrap").getBoundingClientRect().height) + 8 });
   }
-  f.addEventListener('load',function(){ listen(); setTimeout(listen,800); setTimeout(listen,2000); });
-  window.addEventListener('message',function(e){
-    try{
-      var d=(typeof e.data==='string')?JSON.parse(e.data):e.data;
-      if(d && d.event==='infoDelivery' && d.info && typeof d.info.currentTime==='number'){ cur=d.info.currentTime; }
-    }catch(x){}
-  });
-  var bar=document.getElementById('speeds');
-  rates.forEach(function(r){
-    var b=document.createElement('button'); b.textContent=r+'x'; b.id='r'+r;
-    if(r===1) b.className='on';
-    b.onclick=function(){
-      cmd('setPlaybackRate',[r]);
-      rates.forEach(function(x){document.getElementById('r'+x).className=(x===r?'on':'');});
+  new ResizeObserver(fit).observe($("wrap"));
+
+  function autosize() {
+    var t = $("txt");
+    t.style.height = "auto";
+    t.style.height = Math.min(t.scrollHeight, 120) + "px";
+  }
+  function updateSend() { $("send").disabled = !$("txt").value.trim(); }
+  function setStatus(s) { $("chipTxt").textContent = s; }
+
+  /* ----- nhận diện giọng nói (không thu âm, chỉ chuyển thành chữ) ----- */
+  function killRec() {
+    clearTimeout(silenceTimer);
+    if (rec) {
+      var r = rec; rec = null;
+      r.onresult = null; r.onerror = null; r.onend = null;
+      try { r.abort(); } catch (e) {}
+    }
+    listening = false;
+    $("chip").classList.remove("live");
+  }
+  function armTimer() {
+    clearTimeout(silenceTimer);
+    if (autoSecs > 0 && mode === "mic") {
+      silenceTimer = setTimeout(function () {
+        if ($("txt").value.trim()) doSend();
+      }, autoSecs * 1000);
+    }
+  }
+  function startRec() {
+    if (!SR) {
+      setStatus("Trình duyệt không hỗ trợ nhận diện giọng nói · hãy dùng ⌨️");
+      return;
+    }
+    killRec();
+    hadError = false;
+    manualStop = false;
+    base = $("txt").value.trim() ? $("txt").value.trim() + " " : "";
+    rec = new SR();
+    rec.lang = lang;
+    rec.interimResults = true;
+    rec.continuous = true;
+    rec.onstart = function () {
+      listening = true;
+      $("chip").classList.add("live");
+      setStatus(autoSecs > 0 ? "Đang nghe... (tự gửi khi bạn ngừng nói)" : "Đang nghe... (bấm để dừng)");
+      $("txt").placeholder = "Hãy nói...";
     };
-    bar.appendChild(b);
+    rec.onresult = function (e) {
+      var s = "";
+      for (var i = 0; i < e.results.length; i++) s += e.results[i][0].transcript;
+      $("txt").value = base + s;
+      autosize(); updateSend();
+      armTimer();
+    };
+    rec.onerror = function (e) { hadError = true; setStatus(ERR[e.error] || ("Lỗi micro: " + e.error)); };
+    rec.onend = function () {
+      listening = false;
+      $("chip").classList.remove("live");
+      if (!hadError && !manualStop && autoSecs > 0 && mode === "mic" && $("txt").value.trim()) {
+        doSend();
+        return;
+      }
+      if (!hadError) setStatus("Đã dừng · bấm để nói tiếp");
+    };
+    try { rec.start(); } catch (e) {}
+  }
+
+  /* ----- chuyển chế độ ----- */
+  function setMode(m) {
+    mode = m;
+    var chip = $("chip");
+    if (!m) {
+      killRec();
+      $("hint").style.display = "";
+      $("txt").style.display = "none";
+      $("txt").value = "";
+      $("chipRow").style.display = "none";
+      chip.classList.remove("show");
+      autosize(); updateSend(); fit();
+      return;
+    }
+    $("hint").style.display = "none";
+    $("txt").style.display = "block";
+    $("chipRow").style.display = "flex";
+    chip.classList.remove("show"); void chip.offsetWidth; chip.classList.add("show");
+    if (m === "kb") {
+      killRec();
+      $("chipEm").textContent = "⌨️";
+      setStatus("Gõ / dán văn bản");
+      $("txt").placeholder = "Gõ hoặc dán câu hỏi...";
+      $("txt").focus();
+    } else {
+      $("chipEm").textContent = "🎤";
+      startRec();
+    }
+    fit();
+  }
+
+  function doSend() {
+    var text = $("txt").value.trim();
+    if (!text) return;
+    killRec();
+    post("streamlit:setComponentValue", {
+      value: { text: text, id: Date.now() + "-" + Math.random() },
+      dataType: "json"
+    });
+    setMode(null);  // emoji trở về vị trí cũ
+  }
+
+  $("btnKb").addEventListener("click", function () { setMode("kb"); });
+  $("btnMic").addEventListener("click", function () { setMode("mic"); });
+  $("chip").addEventListener("click", function (e) {
+    if (e.target.id === "chipX") { setMode(null); return; }
+    if (mode === "mic") { if (listening && rec) { manualStop = true; clearTimeout(silenceTimer); rec.stop(); } else { startRec(); } }
+    else if (mode === "kb") { $("txt").focus(); }
   });
-  function seekBy(s){ cmd('seekTo',[Math.max(0,cur+s),true]); }
-  function replay(){ cmd('seekTo',[0,true]); cmd('playVideo'); }
+  $("send").addEventListener("click", doSend);
+  $("txt").addEventListener("input", function () { autosize(); updateSend(); });
+  $("txt").addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey && !isMobile) { e.preventDefault(); doSend(); }
+  });
+
+  /* ----- nhận dữ liệu từ Streamlit ----- */
+  window.addEventListener("message", function (e) {
+    var d = e.data;
+    if (!d || d.type !== "streamlit:render") return;
+    var a = d.args || {};
+    if (typeof a.auto_secs === "number") autoSecs = a.auto_secs;
+    if (a.lang && a.lang !== lang) {
+      lang = a.lang;
+      if (mode === "mic" && listening) startRec();
+    }
+    var t = d.theme;
+    if (t) {
+      var s = document.documentElement.style;
+      s.setProperty("--fg", t.textColor);
+      s.setProperty("--bg", t.backgroundColor);
+      s.setProperty("--bg2", t.secondaryBackgroundColor);
+      s.setProperty("--pri", t.primaryColor);
+    }
+    fit();
+  });
+  post("streamlit:componentReady", { apiVersion: 1 });
+  setMode(null);
+})();
 </script>
+</body>
+</html>
 """
 
-
-def render_player(video_id: str, kind: str, captions: bool):
-    short = kind == "short"
-    html = (
-        PLAYER_TEMPLATE.replace("__VID__", video_id)
-        .replace("__CC__", "1" if captions else "0")
-        .replace("__MAXW__", "300" if short else "720")
-        .replace("__RATIO__", "9/16" if short else "16/9")
-    )
-    components.html(html, height=640 if short else 470)
+_comp_dir = Path(tempfile.gettempdir()) / "groq_voice_input"
+_comp_dir.mkdir(exist_ok=True)
+(_comp_dir / "index.html").write_text(COMPONENT_HTML, encoding="utf-8")
+voice_input = components.declare_component("groq_voice_input", path=str(_comp_dir))
 
 
-def speak_buttons(text: str, lang: str = "en-US"):
-    """Đọc to bằng giọng của trình duyệt (hoạt động trên iPhone vì bấm nút)."""
-    safe = json.dumps(text).replace("</", "<\\/")
-    html = """
-    <style>
-      button{border:1px solid #bbb;background:#f6f6f6;border-radius:8px;
-             padding:8px 12px;font-size:15px;margin-right:6px;}
-      @media (prefers-color-scheme: dark){button{background:#2b2b2b;color:#eee;border-color:#555;}}
-    </style>
-    <button onclick="say(1)">🔊 Nghe</button>
-    <button onclick="say(0.7)">🐢 Chậm</button>
-    <button onclick="speechSynthesis.cancel()">⏹</button>
-    <script>
-      var T=__TEXT__;
-      function say(rate){
-        speechSynthesis.cancel();
-        var u=new SpeechSynthesisUtterance(T);
-        u.lang='__LANG__'; u.rate=rate; speechSynthesis.speak(u);
-      }
-    </script>
-    """.replace("__TEXT__", safe).replace("__LANG__", lang)
-    components.html(html, height=50)
-
-
-# ----------------------------------------------------------------------------
-# SIDEBAR
-# ----------------------------------------------------------------------------
-def oembed_info(vid: str):
-    """(tiêu đề, tên kênh, có phải video dọc/Shorts không) qua oEmbed."""
-    try:
-        u = urllib.parse.quote(f"https://www.youtube.com/watch?v={vid}", safe="")
-        d = json.loads(http_get(f"https://www.youtube.com/oembed?format=json&url={u}"))
-        vertical = (d.get("height") or 0) > (d.get("width") or 1)
-        return d.get("title") or vid, d.get("author_name") or "", vertical
-    except Exception:
-        return vid, "", False
-
-
-def paste_link_block():
-    """Dán link bất kỳ video/Shorts YouTube để phát trong iframe."""
-    link = st.sidebar.text_input(
-        "Dán link video/Shorts YouTube", key="paste_link", placeholder="https://youtu.be/..."
-    )
-    if st.sidebar.button("🔗 Lấy bài với link dán vào"):
-        vid = extract_video_id(link or "")
-        if not vid:
-            st.sidebar.error("Link không hợp lệ. Hãy dán link của một video hoặc Shorts.")
-            return
-        with st.spinner("Đang lấy thông tin bài..."):
-            title, author, vertical = oembed_info(vid)
-        st.session_state.videos = [{"id": vid, "title": title}]
-        st.session_state.videos_kind = "short" if ("/shorts/" in link or vertical) else "video"
-        st.session_state.videos_channel = author or "Link dán vào"
-        st.session_state.picked_vid = vid
-        st.session_state.search_failed = False
-
-
-def sidebar():
-    st.sidebar.header("📺 Kênh học tiếng Anh")
-    channels = load_channels()
-
-    # --- Lấy ngẫu nhiên 1 bài từ một kênh bất kỳ trong cac_kenh.json ---
-    if st.sidebar.button("🎲 Lấy ngẫu nhiên 1 bài", disabled=not channels):
-        pick = random.choice(channels)
-        head = f"Kênh: {pick['name']} ({pick['id']})"
-        try:
-            with st.spinner(f"Đang tìm bài mới nhất của {pick['name']}..."):
-                vids, kind, log = latest_shorts_or_videos(pick["id"], n=1)
-            st.session_state.search_log = [head] + log
-            if vids:
-                st.session_state.search_failed = False
-                st.session_state.videos = vids
-                st.session_state.videos_kind = kind
-                st.session_state.videos_channel = pick["name"]
-                st.session_state.picked_vid = vids[0]["id"]  # phát ngay trong iframe
-                st.session_state.sel_id = pick["id"]         # tích chọn kênh này trong bảng
-                st.session_state.kenh_v += 1
-            else:
-                st.session_state.search_failed = True
-        except Exception as e:
-            st.session_state.search_log = [head, f"Ngoại lệ: {type(e).__name__}: {e}"]
-            st.session_state.search_failed = True
-
-    # --- Lưu trữ & quyền chỉnh sửa ---
-    if gh_cfg():
-        st.sidebar.caption("☁️ Danh sách kênh lưu trên GitHub")
-        if st.session_state.get("gh_error"):
-            st.sidebar.error(st.session_state.gh_error)
-        if st.sidebar.button("🔄 Tải lại danh sách"):
-            st.session_state.pop("channels_cache", None)
-            st.rerun()
-
-    writable = can_write()
-    if not writable:
-        with st.sidebar.expander("🔐 Mở khóa để thêm/xóa kênh"):
-            apw = st.text_input("Mật mã quản trị", type="password", key="admin_pw")
-            if st.button("Mở khóa"):
-                if hmac.compare_digest(apw.encode(), st.secrets["ADMIN_PASSWORD"].encode()):
-                    st.session_state.admin_ok = True
-                    st.rerun()
-                else:
-                    st.error("Sai mật mã quản trị.")
-
-    # --- Sửa tên cho các kênh đang bị trùng với id ---
-    bad_ids = {c["id"] for c in channels if not c.get("name") or c["name"] == c["id"]}
-    if bad_ids and writable:
-        if st.sidebar.button(f"🔤 Sửa tên cho {len(bad_ids)} kênh"):
-            fixed = 0
-            with st.spinner("Đang lấy tên kênh..."):
-                for c in channels:
-                    if c["id"] in bad_ids:
-                        n = channel_name(c["id"])
-                        if n:
-                            c["name"] = n
-                            fixed += 1
-            if not fixed:
-                st.sidebar.error("Không lấy được tên kênh nào.")
-            else:
-                try:
-                    save_channels(channels)
-                except Exception as e:
-                    st.sidebar.error(f"Không lưu được: {e}")
-                else:
-                    st.session_state.kenh_v += 1
-                    st.rerun()
-
-    # --- Thêm kênh (bắt buộc nếu chưa có kênh nào) ---
-    if not channels and not st.session_state.get("gh_error"):
-        st.sidebar.info(
-            "Chưa có kênh nào. Dán 1 link video YouTube của kênh bạn muốn học."
-        )
-    with st.sidebar.expander("➕ Thêm kênh", expanded=(not channels and writable)):
-        if not writable:
-            st.caption("Cần mở khóa bằng mật mã quản trị ở trên.")
-        link = st.text_input(
-            "Link 1 video YouTube (hoặc id kênh UC...)", key="add_link", disabled=not writable
-        )
-        if st.button("Thêm kênh", disabled=not writable):
-            try:
-                with st.spinner("Đang lấy id kênh..."):
-                    cid, name = channel_from_link(link)
-                if any(c["id"] == cid for c in channels):
-                    st.warning("Kênh này đã có trong danh sách.")
-                else:
-                    channels.append({"name": name, "id": cid})
-                    save_channels(channels)
-                    st.session_state.kenh_v += 1
-                    st.rerun()
-            except Exception as e:
-                st.error(f"Lỗi: {e}")
-
-    if not channels:
-        paste_link_block()
-        return
-
-    # --- Bảng chọn kênh (chỉ cho chọn 1 kênh) ---
-    sel_id = st.session_state.sel_id
-    del_ids = set(st.session_state.del_ids)
-    df = pd.DataFrame(
-        [
-            {
-                "Chọn": c["id"] == sel_id,
-                "Tên kênh": str(i+1) + '. ' + c["name"],
-                "Id của kênh": c["id"],
-                "Xóa": c["id"] in del_ids,
-            }
-            for i, c in enumerate(channels)
-
-        ]
-    )
-    edited = st.sidebar.data_editor(
-        df,
-        hide_index=True,
-        disabled=["Tên kênh", "Id của kênh"],
-        column_config={
-            "Chọn": st.column_config.CheckboxColumn("Chọn", width="small"),
-            "Xóa": st.column_config.CheckboxColumn("Xóa", width="small"),
+# ---------- Các hàm ----------
+def ask_groq(history):
+    r = requests.post(
+        f"{GROQ}/chat/completions",
+        headers={"Authorization": f"Bearer {API_KEY}"},
+        json={
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": "Bạn là trợ lý hữu ích. Trả lời ngắn gọn, rõ ràng, bằng ngôn ngữ của người hỏi."},
+                *history,
+            ],
         },
-        key=f"kenh_editor_{st.session_state.kenh_v}",
+        timeout=60,
     )
-
-    # ghi nhớ các ô Xóa
-    st.session_state.del_ids = list(edited.loc[edited["Xóa"], "Id của kênh"])
-
-    # nếu vừa tích thêm một kênh khác -> chỉ giữ kênh mới, bỏ chọn kênh cũ
-    checked = list(edited.loc[edited["Chọn"], "Id của kênh"])
-    newly = [i for i in checked if i != sel_id]
-    if newly:
-        st.session_state.sel_id = newly[-1]
-        st.session_state.kenh_v += 1  # vẽ lại bảng với đúng 1 kênh được chọn
-        st.rerun()
-    if not checked:
-        st.session_state.sel_id = None
-
-    paste_link_block()
-
-    c1, c2, c3 = st.sidebar.columns(3)
-    find_clicked = c1.button("🔎 Tìm video")
-    del_clicked = c2.button("🗑 Xóa kênh", disabled=not writable)
-
-    sel_ch = next((c for c in channels if c["id"] == st.session_state.sel_id), None)
-    c3.link_button(
-        "📺 Xem kênh",
-        f"https://www.youtube.com/channel/{sel_ch['id']}" if sel_ch else "https://www.youtube.com",
-        disabled=sel_ch is None,
-        help="Xem trực tiếp kênh đã chọn trên YouTube",
-    )
-
-    if del_clicked:
-        to_del = set(st.session_state.del_ids)
-        if to_del:
-            try:
-                save_channels([c for c in channels if c["id"] not in to_del])
-            except Exception as e:
-                st.sidebar.error(f"Không lưu được: {e}")
-            else:
-                if st.session_state.sel_id in to_del:
-                    st.session_state.sel_id = None
-                st.session_state.del_ids = []
-                st.session_state.kenh_v += 1
-                st.rerun()
-        else:
-            st.sidebar.warning("Hãy tích cột Xóa ở kênh muốn xóa.")
-
-    if find_clicked:
-        chosen = next((c for c in channels if c["id"] == st.session_state.sel_id), None)
-        if chosen is None:
-            st.sidebar.warning("Hãy tích chọn một kênh.")
-        else:
-            head = f"Kênh: {chosen['name']} ({chosen['id']})"
-            try:
-                with st.spinner("Đang tìm Shorts/video mới nhất..."):
-                    vids, kind, log = latest_shorts_or_videos(chosen["id"])
-                st.session_state.search_log = [head] + log
-                if vids:
-                    st.session_state.search_failed = False
-                    st.session_state.videos = vids
-                    st.session_state.videos_kind = kind
-                    st.session_state.videos_channel = chosen["name"]
-                    st.session_state.pop("picked_vid", None)
-                else:
-                    st.session_state.search_failed = True
-            except Exception as e:
-                st.session_state.search_log = [head, f"Ngoại lệ: {type(e).__name__}: {e}"]
-                st.session_state.search_failed = True
-
-    if st.session_state.get("search_failed"):
-        st.sidebar.error("Không lấy được video nào từ kênh này.")
-        with st.sidebar.expander("🔍 Chi tiết lỗi", expanded=True):
-            st.code("\n".join(st.session_state.get("search_log", [])), language=None)
-
-    # --- Chọn 1 short/video ---
-    if st.session_state.videos:
-        st.sidebar.divider()
-        label = "Shorts" if st.session_state.videos_kind == "short" else "Video"
-        st.sidebar.subheader(f"{label} mới nhất – {st.session_state.videos_channel}")
-        ids = [v["id"] for v in st.session_state.videos]
-        titles = {v["id"]: v["title"] for v in st.session_state.videos}
-        st.sidebar.radio(
-            "Chọn một bài",
-            ids,
-            index=None,
-            format_func=lambda i: titles[i],
-            key="picked_vid",
-        )
+    body = r.json()
+    if not r.ok:
+        raise RuntimeError(body.get("error", {}).get("message", "Lỗi từ Groq."))
+    return body["choices"][0]["message"]["content"]
 
 
-# ----------------------------------------------------------------------------
-# PHẦN HỌC VỚI GROQ (màn hình chính, dưới iframe)
-# ----------------------------------------------------------------------------
-def audio_or_text_input(prefix: str, placeholder: str):
-    """Ô ghi âm + ô gõ chữ. Trả về (audio_bytes | None, text)."""
-    n = st.session_state.rec_n
-    audio = st.audio_input("🎤 Nói", key=f"{prefix}_audio_{n}")
-    text = st.text_area(
-        "…hoặc gõ chữ", key=f"{prefix}_text_{n}", placeholder=placeholder, height=80
-    )
-    return (audio.getvalue() if audio else None), text.strip()
+def text_to_speech(text, lang):
+    """Chữ -> file mp3 bằng gTTS."""
+    clean = re.sub(r"[*#`_>~]", "", text)
+    buf = io.BytesIO()
+    gTTS(clean, lang=lang).write_to_fp(buf)
+    return buf.getvalue()
 
 
-def get_user_input(audio_bytes, text) -> str:
-    if audio_bytes:
-        with st.spinner("Đang nhận dạng giọng nói..."):
-            return transcribe(audio_bytes)
-    return text
+# ---------- Giao diện ----------
+CHAT_HEIGHT = 320  # chiều cao khung chat (px), chỉnh theo màn hình của bạn
+AUTO_SEND_SECS = 2.5  # số giây im lặng trước khi tự gửi (khi dùng micro)
 
+c1, c2 = st.columns(2)
+lang_name = c1.selectbox(":red[Ngôn ngữ]", list(LANGS))
+lang, bcp = LANGS[lang_name]
+read_aloud = c2.toggle("Đọc câu trả lời", value=True)
+auto_send = st.toggle("Micro: tự gửi khi ngừng nói", value=True)
 
-def tab_summary(vid, title):
-    if not st.session_state.transcripts.get(vid):
-        err = st.session_state.tr_err.get(vid, "")
-        if any(k in err for k in ("ParseError", "no element", "PoToken")):
-            st.warning(
-                "YouTube hiện không cho máy chủ tải phụ đề tự động (cần mã PoToken), "
-                "nên app chưa có lời thoại cho Groq. Nút CC trong khung video vẫn bật được. "
-                "Chọn một cách dưới đây để có lời thoại:"
-            )
-        else:
-            st.warning("Không lấy được phụ đề tự động. Chọn một cách dưới đây:")
-            if err:
-                st.code(err, language=None)
-        if st.button("🔄 Thử lấy phụ đề tự động lại", key=f"retry_{vid}"):
-            st.session_state.tr_err.pop(vid, None)
-            st.session_state.transcripts.pop(vid, None)
-            st.rerun()
+# Khung chat có chiều cao cố định, nội dung dài sẽ cuộn bên trong khung
+chat_box = st.container(height=CHAT_HEIGHT, border=True)
 
-        with st.expander("🎤 Cách 1: ghi âm lời thoại bằng micro", expanded=True):
-            st.caption(
-                "Phát video bằng loa ngoài, rồi ghi âm ở đây (nơi yên tĩnh, ghi hết video). "
-                "Trên iPhone, bật mic có thể làm video tạm dừng; nếu vậy hãy dùng cách 2 hoặc 3."
-            )
-            rec = st.audio_input("Ghi âm lời thoại", key=f"trrec_{vid}")
-            if st.button("Chuyển thành chữ", key=f"trrecbtn_{vid}"):
-                if not rec:
-                    st.warning("Hãy ghi âm trước.")
-                else:
-                    with st.spinner("Groq đang nhận dạng..."):
-                        txt = transcribe(rec.getvalue())
-                    if txt:
-                        st.session_state.transcripts[vid] = txt
-                        st.rerun()
-                    st.error("Không nghe được nội dung. Thử ghi lại gần loa hơn.")
+# Ô nhập tùy biến nằm ngay dưới khung chat
+sent = voice_input(lang=bcp, auto_secs=AUTO_SEND_SECS if auto_send else 0, key="voice_input")
 
-        with st.expander("📁 Cách 2: tải tệp âm thanh/video lên"):
-            up = st.file_uploader(
-                "Tệp mp3, m4a, wav, mp4, webm (tối đa khoảng 25MB)",
-                type=["mp3", "m4a", "wav", "mp4", "webm", "ogg"],
-                key=f"trup_{vid}",
-            )
-            if st.button("Chuyển thành chữ", key=f"trupbtn_{vid}") and up:
-                with st.spinner("Groq đang nhận dạng..."):
-                    txt = transcribe(up.getvalue(), up.name)
-                if txt:
-                    st.session_state.transcripts[vid] = txt
-                    st.rerun()
-                st.error("Không nghe được nội dung trong tệp.")
+with chat_box:
+    for m in st.session_state.history:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
 
-        with st.expander("📋 Cách 3: dán lời thoại"):
-            pasted = st.text_area("Dán lời thoại tiếng Anh", key=f"paste_{vid}", height=120)
-            if st.button("Dùng nội dung này", key=f"usepaste_{vid}") and pasted.strip():
-                st.session_state.transcripts[vid] = pasted.strip()
-                st.rerun()
-        return
+# Mỗi lần bấm gửi, ô nhập trả về {text, id}; dùng id để không xử lý lại cùng một câu
+question = None
+if sent and sent.get("id") != st.session_state.get("last_id"):
+    st.session_state.last_id = sent.get("id")
+    question = (sent.get("text") or "").strip() or None
 
-    with st.expander("Xem phụ đề/lời thoại gốc"):
-        st.write(st.session_state.transcripts[vid])
-
-    if st.button("📝 Groq tóm tắt nội dung", key=f"sum_{vid}"):
-        with st.spinner("Groq đang tóm tắt..."):
-            res = groq_json(
-                [
-                    {"role": "system", "content": SYSTEM_TUTOR},
-                    {
-                        "role": "user",
-                        "content": (
-                            lesson_context(vid, title)
-                            + "\nTóm tắt nội dung video bằng 4-6 câu tiếng Anh đơn giản (B1), "
-                            "mỗi câu ngắn dễ đọc to. Sau đó dịch sang tiếng Việt. "
-                            'Trả về JSON: {"en": "...", "vi": "..."}'
-                        ),
-                    },
-                ]
-            )
-        st.session_state.summaries[vid] = {
-            "en": str(res.get("en", "")),
-            "vi": str(res.get("vi", "")),
-        }
-
-    summ = st.session_state.summaries.get(vid)
-    if summ:
-        st.markdown("**🇬🇧 English**")
-        st.write(summ["en"])
-        speak_buttons(summ["en"])
-        st.markdown("**🇻🇳 Tiếng Việt**")
-        st.write(summ["vi"])
-
-
-def tab_read(vid, title):
-    summ = st.session_state.summaries.get(vid)
-    if not summ:
-        st.info("Hãy bấm tóm tắt ở tab 📝 trước để có văn bản tập đọc.")
-        return
-    st.markdown("**Văn bản để đọc theo:**")
-    st.write(summ["en"])
-    speak_buttons(summ["en"])
-
-    n = st.session_state.rec_n
-    audio = st.audio_input("🎤 Đọc to đoạn văn trên", key=f"read_audio_{n}")
-    if st.button("✅ Groq chấm điểm bài đọc", key=f"readbtn_{vid}"):
-        if not audio:
-            st.warning("Hãy ghi âm trước.")
-            return
-        heard = get_user_input(audio.getvalue(), "")
-        with st.spinner("Groq đang đánh giá..."):
-            fb = groq_chat(
-                [
-                    {"role": "system", "content": SYSTEM_TUTOR},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Văn bản gốc:\n{summ['en']}\n\n"
-                            f"Máy nhận dạng giọng nói nghe được:\n{heard}\n\n"
-                            "Hãy so sánh và đánh giá việc đọc: điểm /10, từ/cụm bị sót hoặc đọc sai "
-                            "(nghi ngờ phát âm sai), 2-3 lời khuyên cụ thể để cải thiện. "
-                            "Lưu ý: bạn chỉ có kết quả nhận dạng bằng chữ nên không đánh giá được "
-                            "ngữ điệu; hãy nói rõ giới hạn này một câu."
-                        ),
-                    },
-                ]
-            )
-        st.session_state.read_result[vid] = (heard, fb)
-        st.session_state.rec_n += 1
-        st.rerun()
-
-    if vid in st.session_state.read_result:
-        heard, fb = st.session_state.read_result[vid]
-        with st.expander("Máy nghe được bạn nói", expanded=False):
-            st.write(heard)
-        st.markdown(fb)
-
-
-def tab_groq_asks(vid, title):
-    if st.button("❓ Groq đặt câu hỏi", key=f"gqbtn_{vid}"):
-        prev = st.session_state.gq.get(vid, "")
-        with st.spinner("Groq đang nghĩ câu hỏi..."):
-            q = groq_chat(
-                [
-                    {"role": "system", "content": SYSTEM_TUTOR},
-                    {
-                        "role": "user",
-                        "content": (
-                            lesson_context(vid, title)
-                            + "\nHãy hỏi MỘT câu hỏi tiếng Anh ngắn, đơn giản về nội dung bài "
-                            "để người học trả lời bằng lời. "
-                            + (f"Không lặp lại câu này: {prev}. " if prev else "")
-                            + "Chỉ trả về câu hỏi."
-                        ),
-                    },
-                ],
-                temperature=0.8,
-            )
-        st.session_state.gq[vid] = q
-        st.session_state.gq_result.pop(vid, None)
-        st.session_state.rec_n += 1
-        st.rerun()
-
-    q = st.session_state.gq.get(vid)
-    if not q:
-        return
-    st.markdown(f"**Groq hỏi:** {q}")
-    speak_buttons(q)
-
-    audio_bytes, text = audio_or_text_input("gqa", "Gõ câu trả lời bằng tiếng Anh")
-    if st.button("📨 Gửi câu trả lời", key=f"gqsend_{vid}"):
-        if not audio_bytes and not text:
-            st.warning("Hãy nói hoặc gõ câu trả lời.")
-            return
-        answer = get_user_input(audio_bytes, text)
-        with st.spinner("Groq đang đánh giá..."):
-            fb = groq_chat(
-                [
-                    {"role": "system", "content": SYSTEM_TUTOR},
-                    {
-                        "role": "user",
-                        "content": (
-                            lesson_context(vid, title)
-                            + f"\nCâu hỏi: {q}\nCâu trả lời của người học: {answer}\n\n"
-                            "Đánh giá: (1) nội dung có đúng với bài không, (2) lỗi ngữ pháp/từ vựng, "
-                            "(3) một câu trả lời mẫu tốt hơn bằng tiếng Anh, (4) điểm /10."
-                        ),
-                    },
-                ]
-            )
-        st.session_state.gq_result[vid] = (answer, fb)
-        st.session_state.rec_n += 1
-        st.rerun()
-
-    if vid in st.session_state.gq_result:
-        answer, fb = st.session_state.gq_result[vid]
-        st.caption(f"Bạn trả lời: {answer}")
-        st.markdown(fb)
-
-
-def tab_ask_groq(vid, title):
-    audio_bytes, text = audio_or_text_input("ask", "Gõ câu hỏi về nội dung bài (Anh hoặc Việt)")
-    if st.button("📨 Hỏi Groq", key=f"asksend_{vid}"):
-        if not audio_bytes and not text:
-            st.warning("Hãy nói hoặc gõ câu hỏi.")
-        else:
-            question = get_user_input(audio_bytes, text)
-            history = st.session_state.chat.setdefault(vid, [])
-            msgs = [
-                {
-                    "role": "system",
-                    "content": SYSTEM_TUTOR
-                    + " Trả lời câu hỏi dựa trên nội dung bài bên dưới. "
-                    'Trả về JSON: {"en": "câu trả lời tiếng Anh đơn giản", '
-                    '"vi": "bản dịch tiếng Việt"}.\n\n' + lesson_context(vid, title),
-                }
-            ]
-            for h in history[-4:]:
-                msgs.append({"role": "user", "content": h["q"]})
-                msgs.append({"role": "assistant", "content": h["en"]})
-            msgs.append({"role": "user", "content": question})
-            with st.spinner("Groq đang trả lời..."):
-                res = groq_json(msgs)
-            history.append(
-                {"q": question, "en": str(res.get("en", "")), "vi": str(res.get("vi", ""))}
-            )
-            st.session_state.rec_n += 1
-            st.rerun()
-
-    for i, h in enumerate(reversed(st.session_state.chat.get(vid, []))):
+if question:
+    st.session_state.history.append({"role": "user", "content": question})
+    with chat_box:
         with st.chat_message("user"):
-            st.write(h["q"])
+            st.markdown(question)
+
         with st.chat_message("assistant"):
-            st.write(h["en"])
-            if h["vi"]:
-                st.caption(h["vi"])
-            if i == 0:
-                speak_buttons(h["en"])
+            with st.spinner("Đang suy nghĩ..."):
+                try:
+                    reply = ask_groq(st.session_state.history)
+                    st.markdown(reply)
+                    st.session_state.history.append({"role": "assistant", "content": reply})
+                    if read_aloud:
+                        try:
+                            st.audio(text_to_speech(reply, lang), format="audio/mp3", autoplay=True)
+                        except Exception as e:
+                            st.caption(f"Không đọc được câu trả lời: {e}")
+                except Exception as e:
+                    st.error(f"Lỗi: {e}")
+                    st.session_state.history.pop()
 
-
-# ----------------------------------------------------------------------------
-# MÀN HÌNH CHÍNH
-# ----------------------------------------------------------------------------
-def main_screen():
-    vid = st.session_state.get("picked_vid")
-    if not vid:
-        st.title("🎧 Tự học tiếng Anh từ Shorts")
-        st.info(
-            "👈 Mở thanh bên: chọn kênh → bấm **Tìm video** → chọn một bài. "
-            "(Trên iPhone, bấm mũi tên ở góc trên bên trái để mở thanh bên.)"
-        )
-        return
-
-    title = next((v["title"] for v in st.session_state.videos if v["id"] == vid), vid)
-    kind = st.session_state.videos_kind
-
-    # --- iframe ở trên cùng ---
-    captions = st.session_state.get("cc_on", False)
-    render_player(vid, kind, captions)
-
-    c1, c2 = st.columns([1, 2])
-    c1.toggle("Phụ đề (CC)", key="cc_on", help="Bật/tắt sẽ tải lại video")
-    with c2:
-        cols = st.columns(3)
-        for i, col in enumerate(cols, start=1):
-            col.checkbox(f"Nghe lần {i}", key=f"listen_{vid}_{i}")
-    st.caption(f"▶ {title}")
-
-    # Lấy phụ đề một lần cho mỗi video
-    if vid not in st.session_state.transcripts and vid not in st.session_state.tr_err:
-        with st.spinner("Đang lấy phụ đề..."):
-            text, err = get_transcript(vid)
-        if text:
-            st.session_state.transcripts[vid] = text
-        else:
-            st.session_state.tr_err[vid] = err or "Không rõ lỗi."
-
-    # --- Các hoạt động tự học với Groq ---
-    t1, t2, t3, t4 = st.tabs(["📝 Tóm tắt", "📖 Đọc theo", "❓ Groq hỏi", "💬 Hỏi Groq"])
-    with t1:
-        tab_summary(vid, title)
-    with t2:
-        tab_read(vid, title)
-    with t3:
-        tab_groq_asks(vid, title)
-    with t4:
-        tab_ask_groq(vid, title)
-
-
-# ----------------------------------------------------------------------------
-# CHẠY
-# ----------------------------------------------------------------------------
-if check_password():
-    if not st.secrets.get("GROQ_API_KEY"):
-        st.error("Chưa đặt GROQ_API_KEY trong Secrets của Streamlit.")
-        st.stop()
-    sidebar()
-    main_screen()
