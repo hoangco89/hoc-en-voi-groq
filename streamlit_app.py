@@ -33,7 +33,8 @@ KENH_FILE = "cac_kenh.json"
 CHAT_MODEL = "qwen/qwen3.8-27b"   # đổi nếu Groq ngừng model này
 STT_MODEL = "whisper-large-v3-turbo"     # nhận dạng giọng nói
 MAX_CONTEXT_CHARS = 12000                # giới hạn độ dài phụ đề gửi cho Groq
-NUM_VIDEOS = 6
+NUM_VIDEOS = 3
+MAX_POOL = 200                           # số bài tối đa lấy về để bốc ngẫu nhiên
 
 NS = {
     "atom": "http://www.w3.org/2005/Atom",
@@ -45,7 +46,7 @@ UA = (
 )
 
 st.set_page_config(
-    page_title="Học tiếng Anh từ Shorts với Groq AI",
+    page_title="Học English từ Shorts với AI",
     page_icon="🎧",
     layout="centered",
     initial_sidebar_state="expanded",
@@ -60,6 +61,7 @@ def init_state():
         "kenh_v": 0,              # đổi key của bảng kênh sau khi sửa
         "sel_id": None,           # id kênh đang được chọn (chỉ 1)
         "del_ids": [],            # id kênh đang được tích Xóa
+        "pools": {},              # channel_id -> (danh sách bài, loại)
         "videos": [],             # [{id, title}]
         "videos_kind": "",        # "short" | "video"
         "videos_channel": "",
@@ -84,7 +86,7 @@ init_state()
 def check_password() -> bool:
     if st.session_state.auth:
         return True
-    st.header("🎧 Tự Học English từ Shorts với Groq AI")
+    st.title("🎧 Học English từ Shorts với AI")
     expected = st.secrets.get("APP_PASSWORD", "")
     if not expected:
         st.error("Chưa đặt APP_PASSWORD trong Secrets của Streamlit.")
@@ -372,6 +374,66 @@ def latest_shorts_or_videos(channel_id: str, n: int = NUM_VIDEOS):
     return scrape_tab(channel_id, "videos", n, log), "video", log
 
 
+def list_channel_items(channel_id: str, log: list):
+    """Liệt kê tối đa MAX_POOL bài của kênh (Shorts trước, không có thì tất cả video)
+    bằng yt-dlp ở chế độ liệt kê nhanh. Trả về (danh_sách, loại)."""
+    try:
+        import yt_dlp
+    except Exception as e:
+        log.append(f"yt-dlp: chưa cài ({e})")
+        return [], "video"
+    proxy = st.secrets.get("PROXY_URL", "")
+    for label, pid, kind in (
+        ("Shorts", "UUSH" + channel_id[2:], "short"),
+        ("Tất cả video", "UU" + channel_id[2:], "video"),
+    ):
+        try:
+            opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "extract_flat": "in_playlist",
+                "playlistend": MAX_POOL,
+            }
+            if proxy:
+                opts["proxy"] = proxy
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(
+                    f"https://www.youtube.com/playlist?list={pid}", download=False
+                )
+            items = [
+                {"id": e["id"], "title": e.get("title") or e["id"]}
+                for e in (info.get("entries") or [])
+                if e and e.get("id") and (e.get("title") or "") not in ("[Private video]", "[Deleted video]")
+            ]
+            log.append(f"yt-dlp {label}: {len(items)} bài")
+            if items:
+                return items, kind
+        except Exception as e:
+            log.append(f"yt-dlp {label}: {type(e).__name__}: {str(e)[:120]}")
+    return [], "video"
+
+
+def random_from_channel(channel_id: str, avoid_id: str = None):
+    """Bốc ngẫu nhiên 1 bài của kênh. Trả về (bài | None, loại, nhật_ký)."""
+    log = []
+    if channel_id in st.session_state.pools:
+        items, kind = st.session_state.pools[channel_id]
+        log.append(f"Dùng danh sách đã tải: {len(items)} bài")
+    else:
+        items, kind = list_channel_items(channel_id, log)
+        if not items:  # dự phòng: ~15 bài mới nhất từ RSS hoặc trang kênh
+            log.append("Dự phòng RSS/trang kênh:")
+            items, kind, log2 = latest_shorts_or_videos(channel_id, n=15)
+            log += log2
+        if items:
+            st.session_state.pools[channel_id] = (items, kind)
+    if not items:
+        return None, kind, log
+    candidates = [v for v in items if v["id"] != avoid_id] or items
+    return random.choice(candidates), kind, log
+
+
 def transcript_via_api(video_id: str):
     """Trả về (văn bản, lỗi) bằng youtube-transcript-api. Ưu tiên phụ đề tiếng Anh; nếu không có thì dịch sang Anh."""
     try:
@@ -511,6 +573,14 @@ def lesson_context(video_id: str, title: str) -> str:
 # ----------------------------------------------------------------------------
 # THÀNH PHẦN GIAO DIỆN (HTML)
 # ----------------------------------------------------------------------------
+def html_frame(html: str, height: int):
+    """Nhúng HTML trong iframe: dùng st.iframe (Streamlit mới), nếu chưa có thì dùng bản cũ."""
+    if hasattr(st, "iframe"):
+        st.iframe(html, height=height)
+    else:
+        components.html(html, height=height)
+
+
 PLAYER_TEMPLATE = """
 <style>
   body { margin:0; font-family:-apple-system,system-ui,sans-serif; }
@@ -578,7 +648,7 @@ def render_player(video_id: str, kind: str, captions: bool):
         .replace("__MAXW__", "300" if short else "720")
         .replace("__RATIO__", "9/16" if short else "16/9")
     )
-    components.html(html, height=640 if short else 470)
+    html_frame(html, height=640 if short else 470)
 
 
 def speak_buttons(text: str, lang: str = "en-US"):
@@ -602,7 +672,7 @@ def speak_buttons(text: str, lang: str = "en-US"):
       }
     </script>
     """.replace("__TEXT__", safe).replace("__LANG__", lang)
-    components.html(html, height=50)
+    html_frame(html, height=50)
 
 
 # ----------------------------------------------------------------------------
@@ -788,6 +858,9 @@ def sidebar():
         disabled=sel_ch is None,
         help="Xem trực tiếp kênh đã chọn trên YouTube",
     )
+    rand_clicked = st.sidebar.button(
+        "🎯 Tìm ngẫu nhiên 1 bài của kênh chọn", disabled=sel_ch is None
+    )
 
     if del_clicked:
         to_del = set(st.session_state.del_ids)
@@ -826,6 +899,26 @@ def sidebar():
             except Exception as e:
                 st.session_state.search_log = [head, f"Ngoại lệ: {type(e).__name__}: {e}"]
                 st.session_state.search_failed = True
+
+    if rand_clicked and sel_ch:
+        head = f"Kênh: {sel_ch['name']} ({sel_ch['id']})"
+        try:
+            with st.spinner("Đang lấy danh sách bài của kênh..."):
+                item, kind, log = random_from_channel(
+                    sel_ch["id"], avoid_id=st.session_state.get("picked_vid")
+                )
+            st.session_state.search_log = [head] + log
+            if item:
+                st.session_state.search_failed = False
+                st.session_state.videos = [item]
+                st.session_state.videos_kind = kind
+                st.session_state.videos_channel = sel_ch["name"]
+                st.session_state.picked_vid = item["id"]
+            else:
+                st.session_state.search_failed = True
+        except Exception as e:
+            st.session_state.search_log = [head, f"Ngoại lệ: {type(e).__name__}: {e}"]
+            st.session_state.search_failed = True
 
     if st.session_state.get("search_failed"):
         st.sidebar.error("Không lấy được video nào từ kênh này.")
@@ -1125,11 +1218,11 @@ def main_screen():
 
     c1, c2 = st.columns([1, 2])
     c1.toggle("Phụ đề (CC)", key="cc_on", help="Bật/tắt sẽ tải lại video")
-    with c2:
-        cols = st.columns(3)
-        for i, col in enumerate(cols, start=1):
-            col.checkbox(f"Nghe lần {i}", key=f"listen_{vid}_{i}")
-    st.caption(f"▶ {title}")
+    #with c2:
+    #    cols = st.columns(3)
+    #    for i, col in enumerate(cols, start=1):
+    #        col.checkbox(f"Nghe lần {i}", key=f"listen_{vid}_{i}")
+    #st.caption(f"▶ {title}")
 
     # Lấy phụ đề một lần cho mỗi video
     if vid not in st.session_state.transcripts and vid not in st.session_state.tr_err:
@@ -1161,4 +1254,3 @@ if check_password():
         st.stop()
     sidebar()
     main_screen()
-
