@@ -33,7 +33,7 @@ KENH_FILE = "cac_kenh.json"
 CHAT_MODEL = "qwen/qwen3.8-27b"   # đổi nếu Groq ngừng model này
 STT_MODEL = "whisper-large-v3-turbo"     # nhận dạng giọng nói
 MAX_CONTEXT_CHARS = 12000                # giới hạn độ dài phụ đề gửi cho Groq
-NUM_VIDEOS = 3
+NUM_VIDEOS = 5
 MAX_POOL = 200                           # số bài tối đa lấy về để bốc ngẫu nhiên
 
 NS = {
@@ -848,7 +848,7 @@ def sidebar():
     paste_link_block()
 
     c1, c2, c3 = st.sidebar.columns(3)
-    find_clicked = c1.button("🔎 Tìm video")
+    find_clicked = c1.button("🔎 Tìm video mới của kênh")
     del_clicked = c2.button("🗑 Xóa kênh", disabled=not writable)
 
     sel_ch = next((c for c in channels if c["id"] == st.session_state.sel_id), None)
