@@ -46,7 +46,7 @@ UA = (
 )
 
 st.set_page_config(
-    page_title="Học English từ Shorts với AI",
+    page_title="Tự học tiếng Anh từ Shorts với AI",
     page_icon="🎧",
     layout="centered",
     initial_sidebar_state="expanded",
@@ -86,7 +86,7 @@ init_state()
 def check_password() -> bool:
     if st.session_state.auth:
         return True
-    st.title("🎧 Học English từ Shorts với AI")
+    st.header("🎧 Tự học tiếng Anh từ Shorts với AI")
     expected = st.secrets.get("APP_PASSWORD", "")
     if not expected:
         st.error("Chưa đặt APP_PASSWORD trong Secrets của Streamlit.")
@@ -1202,7 +1202,7 @@ def tab_ask_groq(vid, title):
 def main_screen():
     vid = st.session_state.get("picked_vid")
     if not vid:
-        st.title("🎧 Tự học tiếng Anh từ Shorts")
+        st.header("🎧 Tự học tiếng Anh từ Shorts với AI")
         st.info(
             "👈 Mở thanh bên: chọn kênh → bấm **Tìm video** → chọn một bài. "
             "(Trên iPhone, bấm mũi tên ở góc trên bên trái để mở thanh bên.)"
