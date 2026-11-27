@@ -1429,10 +1429,10 @@ def main_screen():
 
     c1, c2 = st.columns([1, 2])
     c1.toggle("Phụ đề (CC)", key="cc_on", help="Bật/tắt sẽ tải lại video")
-    with c2:
-        cols = st.columns(3)
-        for i, col in enumerate(cols, start=1):
-            col.checkbox(f"Nghe lần {i}", key=f"listen_{vid}_{i}")
+    #with c2:
+    #    cols = st.columns(3)
+    #    for i, col in enumerate(cols, start=1):
+    #        col.checkbox(f"Nghe lần {i}", key=f"listen_{vid}_{i}")
     st.caption(f"▶ {title}")
 
     # Lấy phụ đề một lần cho mỗi video
