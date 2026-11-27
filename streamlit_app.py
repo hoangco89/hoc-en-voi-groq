@@ -47,7 +47,7 @@ UA = (
 )
 
 st.set_page_config(
-    page_title="Tự học tiếng Anh từ Shorts",
+    page_title="Tự học tiếng Anh từ Youtube",
     page_icon="🎧",
     layout="centered",
     initial_sidebar_state="expanded",
@@ -90,7 +90,7 @@ init_state()
 def check_password() -> bool:
     if st.session_state.auth:
         return True
-    st.title("🎧 Tự học tiếng Anh từ Shorts")
+    st.title("🎧 Tự học tiếng Anh từ Youtube")
     expected = st.secrets.get("APP_PASSWORD", "")
     if not expected:
         st.error("Chưa đặt APP_PASSWORD trong Secrets của Streamlit.")
