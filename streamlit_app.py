@@ -33,7 +33,8 @@ KENH_FILE = "cac_kenh.json"
 CHAT_MODEL = "qwen/qwen3.8-27b"   # đổi nếu Groq ngừng model này
 STT_MODEL = "whisper-large-v3-turbo"     # nhận dạng giọng nói
 MAX_CONTEXT_CHARS = 12000                # giới hạn độ dài phụ đề gửi cho Groq
-NUM_VIDEOS = 5
+NUM_VIDEOS = 3
+MAX_PLAYLIST = 300                       # số bài tối đa lấy từ một playlist
 MAX_POOL = 200                           # số bài tối đa lấy về để bốc ngẫu nhiên
 
 NS = {
@@ -46,7 +47,7 @@ UA = (
 )
 
 st.set_page_config(
-    page_title="Tự học tiếng Anh từ Shorts với AI",
+    page_title="Tự học tiếng Anh từ Shorts",
     page_icon="🎧",
     layout="centered",
     initial_sidebar_state="expanded",
@@ -62,6 +63,9 @@ def init_state():
         "sel_id": None,           # id kênh đang được chọn (chỉ 1)
         "del_ids": [],            # id kênh đang được tích Xóa
         "pools": {},              # channel_id -> (danh sách bài, loại)
+        "playlists": {},          # channel_id -> [{id, title}]
+        "playlists_err": {},      # channel_id -> nhật ký lỗi
+        "videos_comp": "",        # nhãn thành phần đang hiển thị
         "videos": [],             # [{id, title}]
         "videos_kind": "",        # "short" | "video"
         "videos_channel": "",
@@ -86,7 +90,7 @@ init_state()
 def check_password() -> bool:
     if st.session_state.auth:
         return True
-    st.header("🎧 Tự học tiếng Anh từ Shorts với AI")
+    st.title("🎧 Tự học tiếng Anh từ Shorts")
     expected = st.secrets.get("APP_PASSWORD", "")
     if not expected:
         st.error("Chưa đặt APP_PASSWORD trong Secrets của Streamlit.")
@@ -678,6 +682,162 @@ def speak_buttons(text: str, lang: str = "en-US"):
 # ----------------------------------------------------------------------------
 # SIDEBAR
 # ----------------------------------------------------------------------------
+COMP_LABELS = ["Shorts", "Videos", "Playlist", "Live"]
+# thành phần -> (tiền tố playlist hệ thống của YouTube, loại khung phát, tab trang kênh)
+COMP_PREFIX = {
+    "Shorts": ("UUSH", "short", "shorts"),
+    "Videos": ("UULF", "video", "videos"),
+    "Live": ("UULV", "video", "streams"),
+}
+
+
+def _clean_entries(info: dict, n: int):
+    out = []
+    for e in info.get("entries") or []:
+        if e and e.get("id") and (e.get("title") or "") not in ("[Private video]", "[Deleted video]"):
+            out.append({"id": e["id"], "title": e.get("title") or e["id"]})
+    return out[:n]
+
+
+def ytdlp_flat(url: str, n: int, log: list, label: str):
+    """Liệt kê nhanh tối đa n mục của một playlist/tab bằng yt-dlp."""
+    try:
+        import yt_dlp
+    except Exception as e:
+        log.append(f"yt-dlp {label}: chưa cài ({e})")
+        return []
+    try:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "extract_flat": "in_playlist",
+            "playlistend": n,
+        }
+        proxy = st.secrets.get("PROXY_URL", "")
+        if proxy:
+            opts["proxy"] = proxy
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        items = _clean_entries(info, n)
+        log.append(f"yt-dlp {label}: {len(items)} mục")
+        return items
+    except Exception as e:
+        log.append(f"yt-dlp {label}: {type(e).__name__}: {str(e)[:120]}")
+        return []
+
+
+def playlist_videos(playlist_id: str, n: int, log: list, label: str):
+    items = try_feed(
+        f"https://www.youtube.com/feeds/videos.xml?playlist_id={playlist_id}",
+        f"RSS {label}", log,
+    )
+    if items:
+        return items[:n]
+    return ytdlp_flat(f"https://www.youtube.com/playlist?list={playlist_id}", n, log, label)
+
+
+def list_channel_playlists(channel_id: str, log: list):
+    """Danh sách playlist do kênh tạo: [{id, title}]."""
+    items = []
+    try:
+        import yt_dlp
+
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "extract_flat": "in_playlist",
+            "playlistend": 50,
+        }
+        proxy = st.secrets.get("PROXY_URL", "")
+        if proxy:
+            opts["proxy"] = proxy
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(
+                f"https://www.youtube.com/channel/{channel_id}/playlists", download=False
+            )
+
+        def walk(entries):
+            for e in entries or []:
+                if not e:
+                    continue
+                if e.get("entries"):
+                    yield from walk(e["entries"])
+                elif e.get("id") and not str(e["id"]).startswith("UC"):
+                    yield {"id": e["id"], "title": e.get("title") or e["id"]}
+
+        seen = set()
+        for it in walk(info.get("entries")):
+            if it["id"] not in seen:
+                seen.add(it["id"])
+                items.append(it)
+        log.append(f"yt-dlp playlist: {len(items)} playlist")
+    except Exception as e:
+        log.append(f"yt-dlp playlist: {type(e).__name__}: {str(e)[:120]}")
+    if items:
+        return items
+    try:  # dự phòng: đọc trang /playlists (không có tiêu đề)
+        page = http_get(f"https://www.youtube.com/channel/{channel_id}/playlists")
+        ids = list(dict.fromkeys(re.findall(r'"playlistId":"(PL[\w-]+)"', page)))[:50]
+        log.append(f"trang /playlists: {len(ids)} id")
+        return [{"id": i, "title": f"Playlist …{i[-6:]}"} for i in ids]
+    except Exception as e:
+        log.append(f"trang /playlists: {type(e).__name__}: {str(e)[:120]}")
+        return []
+
+
+def fetch_component(channel_id: str, comp: str, playlist_id: str = None,
+                    playlist_title: str = "", n: int = NUM_VIDEOS):
+    """Lấy n bài của thành phần đã chọn. Trả về (danh_sách, loại, nhật_ký, nhãn)."""
+    log = []
+    if comp == "Playlist":
+        if not playlist_id:
+            return [], "video", ["Chưa chọn playlist."], ""
+        # Lấy TOÀN BỘ playlist theo đúng thứ tự (yt-dlp); RSS chỉ là dự phòng (~15 bài)
+        items = ytdlp_flat(
+            f"https://www.youtube.com/playlist?list={playlist_id}",
+            MAX_PLAYLIST, log, "Playlist",
+        )
+        partial = False
+        if not items:
+            items = try_feed(
+                f"https://www.youtube.com/feeds/videos.xml?playlist_id={playlist_id}",
+                "RSS Playlist", log,
+            )
+            partial = bool(items)
+        items = [
+            {"id": it["id"], "title": f"{i}. {it['title']}"}
+            for i, it in enumerate(items, start=1)
+        ]
+        label = f"Playlist “{playlist_title}” – {len(items)} video theo thứ tự"
+        if partial:
+            label += " (chỉ lấy được phần đầu)"
+        return items, "video", log, label
+
+    prefix, kind, tab = COMP_PREFIX[comp]
+    items = playlist_videos(prefix + channel_id[2:], n, log, comp)
+    if not items:
+        items = scrape_tab(channel_id, tab, n, log)
+    if items:
+        names = {"Shorts": "Shorts", "Videos": "video", "Live": "Live"}
+        return items, kind, log, f"{n} {names[comp]} mới nhất"
+
+    if comp == "Shorts":  # giữ quy tắc cũ: kênh không có Shorts thì lấy video
+        log.append("Không có Shorts, thử lấy video:")
+        items = playlist_videos("UULF" + channel_id[2:], n, log, "Videos")
+        if not items:
+            items = try_feed(
+                f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}",
+                "RSS kênh", log,
+            )[:n]
+        if not items:
+            items = scrape_tab(channel_id, "videos", n, log)
+        if items:
+            return items, "video", log, f"Kênh không có Shorts – {n} video mới nhất"
+    return [], kind, log, ""
+
+
 def oembed_info(vid: str):
     """(tiêu đề, tên kênh, có phải video dọc/Shorts không) qua oEmbed."""
     try:
@@ -704,6 +864,7 @@ def paste_link_block():
         st.session_state.videos = [{"id": vid, "title": title}]
         st.session_state.videos_kind = "short" if ("/shorts/" in link or vertical) else "video"
         st.session_state.videos_channel = author or "Link dán vào"
+        st.session_state.videos_comp = "Bài từ link dán vào"
         st.session_state.picked_vid = vid
         st.session_state.search_failed = False
 
@@ -725,6 +886,7 @@ def sidebar():
                 st.session_state.videos = vids
                 st.session_state.videos_kind = kind
                 st.session_state.videos_channel = pick["name"]
+                st.session_state.videos_comp = "Bài ngẫu nhiên"
                 st.session_state.picked_vid = vids[0]["id"]  # phát ngay trong iframe
                 st.session_state.sel_id = pick["id"]         # tích chọn kênh này trong bảng
                 st.session_state.kenh_v += 1
@@ -813,17 +975,17 @@ def sidebar():
         [
             {
                 "Chọn": c["id"] == sel_id,
-                "Tên kênh": str(i+1) + '. ' + c["name"],
+                "Tên kênh": str(j)+". "+c["name"],
                 "Id của kênh": c["id"],
                 "Xóa": c["id"] in del_ids,
             }
-            for i, c in enumerate(channels)
-
+            for j, c in  enumerate(channels)
         ]
     )
     edited = st.sidebar.data_editor(
         df,
         hide_index=True,
+        column_order=["Chọn", "Tên kênh", "Xóa"],  # Chỉ hiện 3 cột này, ẩn "Id của kênh"
         disabled=["Tên kênh", "Id của kênh"],
         column_config={
             "Chọn": st.column_config.CheckboxColumn("Chọn", width="small"),
@@ -847,8 +1009,45 @@ def sidebar():
 
     paste_link_block()
 
+    # --- Chọn thành phần của kênh cần lấy ---
+    sel_ch = next((c for c in channels if c["id"] == st.session_state.sel_id), None)
+    comp = st.sidebar.radio(
+        "Lấy thành phần nào của kênh chọn?",
+        COMP_LABELS,
+        horizontal=True,
+        key="component",
+    )
+    playlist_id, playlist_title = None, ""
+    if comp == "Playlist":
+        if sel_ch is None:
+            st.sidebar.caption("Hãy chọn một kênh để xem danh sách playlist của kênh.")
+        else:
+            cid = sel_ch["id"]
+            if cid not in st.session_state.playlists and cid not in st.session_state.playlists_err:
+                plog = []
+                with st.spinner("Đang lấy danh sách playlist..."):
+                    pls = list_channel_playlists(cid, plog)
+                if pls:
+                    st.session_state.playlists[cid] = pls
+                else:
+                    st.session_state.playlists_err[cid] = plog
+            pls = st.session_state.playlists.get(cid)
+            if pls:
+                ptitles = {p["id"]: p["title"] for p in pls}
+                playlist_id = st.sidebar.selectbox(
+                    "Chọn playlist",
+                    [p["id"] for p in pls],
+                    format_func=lambda i: ptitles[i],
+                    key=f"playlist_pick_{cid}",
+                )
+                playlist_title = ptitles.get(playlist_id, "")
+            else:
+                st.sidebar.warning("Kênh này không có playlist, hoặc không lấy được danh sách.")
+                with st.sidebar.expander("🔍 Chi tiết"):
+                    st.code("\n".join(st.session_state.playlists_err.get(cid, [])), language=None)
+
     c1, c2, c3 = st.sidebar.columns(3)
-    find_clicked = c1.button("🔎 Tìm video mới của kênh")
+    find_clicked = c1.button("🔎 Tìm video")
     del_clicked = c2.button("🗑 Xóa kênh", disabled=not writable)
 
     sel_ch = next((c for c in channels if c["id"] == st.session_state.sel_id), None)
@@ -884,15 +1083,22 @@ def sidebar():
             st.sidebar.warning("Hãy tích chọn một kênh.")
         else:
             head = f"Kênh: {chosen['name']} ({chosen['id']})"
+            if comp == "Playlist" and not playlist_id:
+                # chưa có danh sách playlist -> xóa dấu lỗi để tải lại ở lần chạy kế tiếp
+                st.session_state.playlists_err.pop(chosen["id"], None)
+                st.rerun()
             try:
-                with st.spinner("Đang tìm Shorts/video mới nhất..."):
-                    vids, kind, log = latest_shorts_or_videos(chosen["id"])
+                with st.spinner(f"Đang tìm {comp}..."):
+                    vids, kind, log, comp_label = fetch_component(
+                        chosen["id"], comp, playlist_id, playlist_title
+                    )
                 st.session_state.search_log = [head] + log
                 if vids:
                     st.session_state.search_failed = False
                     st.session_state.videos = vids
                     st.session_state.videos_kind = kind
                     st.session_state.videos_channel = chosen["name"]
+                    st.session_state.videos_comp = comp_label
                     st.session_state.pop("picked_vid", None)
                 else:
                     st.session_state.search_failed = True
@@ -913,6 +1119,7 @@ def sidebar():
                 st.session_state.videos = [item]
                 st.session_state.videos_kind = kind
                 st.session_state.videos_channel = sel_ch["name"]
+                st.session_state.videos_comp = "Bài ngẫu nhiên của kênh"
                 st.session_state.picked_vid = item["id"]
             else:
                 st.session_state.search_failed = True
@@ -928,17 +1135,21 @@ def sidebar():
     # --- Chọn 1 short/video ---
     if st.session_state.videos:
         st.sidebar.divider()
-        label = "Shorts" if st.session_state.videos_kind == "short" else "Video"
-        st.sidebar.subheader(f"{label} mới nhất – {st.session_state.videos_channel}")
+        label = st.session_state.videos_comp or (
+            "Shorts mới nhất" if st.session_state.videos_kind == "short" else "Video mới nhất"
+        )
+        st.sidebar.subheader(f"{label} – {st.session_state.videos_channel}")
         ids = [v["id"] for v in st.session_state.videos]
         titles = {v["id"]: v["title"] for v in st.session_state.videos}
-        st.sidebar.radio(
-            "Chọn một bài",
-            ids,
-            index=None,
-            format_func=lambda i: titles[i],
-            key="picked_vid",
-        )
+        box = st.sidebar.container(height=360) if len(ids) > 6 else st.sidebar.container()
+        with box:
+            st.radio(
+                "Chọn một bài",
+                ids,
+                index=None,
+                format_func=lambda i: titles[i],
+                key="picked_vid",
+            )
 
 
 # ----------------------------------------------------------------------------
@@ -1202,7 +1413,7 @@ def tab_ask_groq(vid, title):
 def main_screen():
     vid = st.session_state.get("picked_vid")
     if not vid:
-        st.header("🎧 Tự học tiếng Anh từ Shorts với AI")
+        st.title("🎧 Tự học tiếng Anh từ Shorts")
         st.info(
             "👈 Mở thanh bên: chọn kênh → bấm **Tìm video** → chọn một bài. "
             "(Trên iPhone, bấm mũi tên ở góc trên bên trái để mở thanh bên.)"
@@ -1218,11 +1429,11 @@ def main_screen():
 
     c1, c2 = st.columns([1, 2])
     c1.toggle("Phụ đề (CC)", key="cc_on", help="Bật/tắt sẽ tải lại video")
-    #with c2:
-    #    cols = st.columns(3)
-    #    for i, col in enumerate(cols, start=1):
-    #        col.checkbox(f"Nghe lần {i}", key=f"listen_{vid}_{i}")
-    #st.caption(f"▶ {title}")
+    with c2:
+        cols = st.columns(3)
+        for i, col in enumerate(cols, start=1):
+            col.checkbox(f"Nghe lần {i}", key=f"listen_{vid}_{i}")
+    st.caption(f"▶ {title}")
 
     # Lấy phụ đề một lần cho mỗi video
     if vid not in st.session_state.transcripts and vid not in st.session_state.tr_err:
